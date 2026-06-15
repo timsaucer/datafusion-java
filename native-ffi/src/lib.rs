@@ -60,6 +60,14 @@ pub mod registry;
 pub mod runtime;
 pub mod scan;
 
+/// Generated protobuf types for the scan config / request wire formats
+/// (`proto/scan_config.proto`, `proto/scan_request.proto`). The `ScanConfig`
+/// blob is decoded by provider builders; `ScanRequest` is the engine-side
+/// staging object exploded into the C call's typed arguments.
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/datafusion_java.rs"));
+}
+
 #[cfg(feature = "demo-providers")]
 pub mod demo;
 

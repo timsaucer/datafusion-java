@@ -60,3 +60,10 @@ tokio = { workspace = true }
 # Round-trip tests import the produced FFI_ArrowArrayStream back into Rust via
 # the same C Stream interface a Java/Python/Go consumer would use.
 datafusion-scan-ffi = { path = ".", features = ["demo-providers"] }
+
+[build-dependencies]
+# Compiles scan_config.proto / scan_request.proto (and the per-format read
+# option messages they embed) into Rust so provider builders can decode the
+# `options` blob. Mirrors `native/build.rs`.
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

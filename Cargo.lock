@@ -1535,6 +1535,8 @@ dependencies = [
  "datafusion-scan-ffi",
  "futures",
  "prost",
+ "prost-build",
+ "protoc-bin-vendored",
  "tokio",
 ]
 
