@@ -95,6 +95,11 @@ class DatafusionSourceTest {
   }
 
   @Test
+  void limitPushdownCapsRows() throws Exception {
+    assertEquals(2, read().limit(2).count());
+  }
+
+  @Test
   void filterPushdownReducesRows() throws Exception {
     Dataset<Row> filtered = read().filter(functions.col("id").geq(2));
     assertEquals(2, filtered.count());

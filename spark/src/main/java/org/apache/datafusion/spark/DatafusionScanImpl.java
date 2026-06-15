@@ -47,6 +47,11 @@ final class DatafusionScanImpl implements Scan, Batch {
     this.readSchema = readSchema;
   }
 
+  /** The encoded ScanRequest bytes. Package-private for pushdown unit tests. */
+  byte[] scanRequestBytes() {
+    return scanRequest;
+  }
+
   @Override
   public StructType readSchema() {
     return readSchema;

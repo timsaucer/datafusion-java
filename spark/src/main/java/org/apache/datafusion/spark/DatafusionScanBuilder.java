@@ -25,6 +25,7 @@ import org.apache.datafusion.protobuf.ScanRequest;
 import org.apache.spark.sql.connector.read.Scan;
 import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
+import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
 import org.apache.spark.sql.types.StructType;
@@ -32,11 +33,14 @@ import org.apache.spark.sql.types.StructType;
 import com.google.protobuf.ByteString;
 
 /**
- * Captures Spark's projection and filter pushdown, encoding them into the {@code ScanRequest} the
- * scan ABI consumes.
+ * Captures Spark's projection, filter, and limit pushdown, encoding them into the {@code
+ * ScanRequest} the scan ABI consumes.
  */
 final class DatafusionScanBuilder
-    implements ScanBuilder, SupportsPushDownRequiredColumns, SupportsPushDownFilters {
+    implements ScanBuilder,
+        SupportsPushDownRequiredColumns,
+        SupportsPushDownFilters,
+        SupportsPushDownLimit {
 
   private final String provider;
   private final byte[] config;
@@ -44,6 +48,7 @@ final class DatafusionScanBuilder
   private StructType requiredSchema;
   private Filter[] pushedFilters = new Filter[0];
   private List<byte[]> pushedFilterBytes = List.of();
+  private int limit = -1;
 
   DatafusionScanBuilder(StructType fullSchema, String provider, byte[] config) {
     this.provider = provider;
@@ -70,6 +75,15 @@ final class DatafusionScanBuilder
   }
 
   @Override
+  public boolean pushLimit(int limit) {
+    // DataFusion enforces the limit exactly (df.limit after filters), and a
+    // limited plan coalesces to a single output partition, so the total row
+    // count is bounded. Report it as fully handled.
+    this.limit = limit;
+    return true;
+  }
+
+  @Override
   public Scan build() {
     ScanRequest.Builder request = ScanRequest.newBuilder();
     for (String name : requiredSchema.fieldNames()) {
@@ -77,6 +91,9 @@ final class DatafusionScanBuilder
     }
     for (byte[] filter : pushedFilterBytes) {
       request.addFilters(ByteString.copyFrom(filter));
+    }
+    if (limit >= 0) {
+      request.setLimit(limit);
     }
     return new DatafusionScanImpl(provider, config, request.build().toByteArray(), requiredSchema);
   }
