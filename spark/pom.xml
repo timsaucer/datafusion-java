@@ -33,34 +33,52 @@
     <description>A Spark DataSourceV2 backed by a DataFusion TableProvider via the plain-C scan ABI.</description>
 
     <properties>
-        <spark.version>3.5.3</spark.version>
+        <spark.version>4.0.0</spark.version>
         <scala.binary.version>2.13</scala.binary.version>
+        <!-- The Arrow the target Spark ships. We compile against it but do not
+             bundle it: at runtime the cluster's Arrow is the single arrow-java
+             in the executor JVM, shared by our stream import AND Spark's
+             ArrowColumnVector -> zero-copy columnar. -->
+        <spark.arrow.version>18.1.0</spark.arrow.version>
     </properties>
 
     <dependencies>
-        <!-- The JVM scan API (DatafusionScan) + generated protobuf classes. -->
+        <!-- The JVM scan API (DatafusionScan) + generated protobuf classes.
+             Arrow is excluded so it does not drag datafusion-java's own Arrow
+             19 onto this module's classpath; the Spark-provided Arrow is the
+             single version here. (datafusion-java itself stays on Arrow 19 for
+             its standalone use; only its Arrow transitive is dropped here.) -->
         <dependency>
             <groupId>org.apache.datafusion</groupId>
             <artifactId>datafusion-java</artifactId>
             <version>${project.version}</version>
-        </dependency>
-
-        <!-- Spark. `provided`: the host cluster supplies it at runtime, and it
-             is on the test classpath for the embedded SparkSession. Arrow is
-             excluded so our Arrow ${arrow.version} (from datafusion-java) is
-             the single version on the classpath; the row-based reader never
-             touches Spark's bundled Arrow. -->
-        <dependency>
-            <groupId>org.apache.spark</groupId>
-            <artifactId>spark-sql_${scala.binary.version}</artifactId>
-            <version>${spark.version}</version>
-            <scope>provided</scope>
             <exclusions>
                 <exclusion>
                     <groupId>org.apache.arrow</groupId>
                     <artifactId>*</artifactId>
                 </exclusion>
             </exclusions>
+        </dependency>
+
+        <!-- Spark. `provided`: the host cluster supplies it (and its Arrow) at
+             runtime, and it is on the test classpath for the embedded
+             SparkSession. Brings arrow-vector / arrow-memory transitively. -->
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.binary.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- Arrow C Data interface (Data.importArrayStream, ArrowArrayStream).
+             Not bundled by Spark, so declared explicitly, but `provided`: it
+             must match whatever Arrow the cluster runs. Pinned to the target
+             Spark's Arrow as the compile baseline. -->
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-c-data</artifactId>
+            <version>${spark.arrow.version}</version>
+            <scope>provided</scope>
         </dependency>
 
         <!-- Test -->

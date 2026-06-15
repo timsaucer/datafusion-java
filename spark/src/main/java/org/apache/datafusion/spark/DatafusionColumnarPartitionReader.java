@@ -23,36 +23,43 @@ import java.io.IOException;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowReader;
 import org.apache.datafusion.scan.DatafusionScan;
-import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.PartitionReader;
+import org.apache.spark.sql.vectorized.ArrowColumnVector;
+import org.apache.spark.sql.vectorized.ColumnVector;
+import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 /**
- * Reads one scan partition into Spark {@link InternalRow}s.
+ * Reads one scan partition as Spark {@link ColumnarBatch}es, zero-copy.
  *
- * <p>Runs on the executor: rebuilds the scan from the partition's bytes, executes its single
- * partition, and streams batches in through the Arrow C Stream interface. Each batch is walked row
- * by row ({@link ArrowToInternalRow}) so no Arrow data crosses with Spark's bundled Arrow.
+ * <p>The Arrow vectors imported from the native stream are wrapped directly in Spark {@link
+ * ArrowColumnVector}s -- no per-cell copy. This requires the executor JVM to have a single
+ * arrow-java (the cluster's Spark Arrow); the connector compiles against that version and never
+ * bundles its own, so our import and Spark's {@code ArrowColumnVector} share the same classes.
+ *
+ * <p>Lifecycle: the underlying Arrow vectors are owned by the {@link ArrowReader}. We do not close
+ * the {@link ColumnarBatch} (which would close those vectors a second time); {@link #close()}
+ * closes the reader -- freeing the vectors once -- and then the allocator.
  */
-final class DatafusionPartitionReader implements PartitionReader<InternalRow> {
+final class DatafusionColumnarPartitionReader implements PartitionReader<ColumnarBatch> {
 
   private final BufferAllocator allocator;
   private final DatafusionScan scan;
   private final ArrowReader reader;
   private final VectorSchemaRoot root;
+  private final ColumnarBatch batch;
 
-  private int currentRow = -1;
-  private int batchRows;
-
-  DatafusionPartitionReader(DatafusionInputPartition partition) {
+  DatafusionColumnarPartitionReader(DatafusionInputPartition partition) {
     this.allocator = new RootAllocator();
     try {
       this.scan =
           DatafusionScan.create(partition.provider, partition.config, partition.scanRequest);
       this.reader = scan.executePartition(allocator, partition.index);
       this.root = reader.getVectorSchemaRoot();
+      this.batch = new ColumnarBatch(wrap(root));
     } catch (IOException e) {
       allocator.close();
       throw new RuntimeException("failed to open scan partition " + partition.index, e);
@@ -62,27 +69,36 @@ final class DatafusionPartitionReader implements PartitionReader<InternalRow> {
     }
   }
 
-  @Override
-  public boolean next() throws IOException {
-    currentRow++;
-    while (currentRow >= batchRows) {
-      if (!reader.loadNextBatch()) {
-        return false;
-      }
-      batchRows = root.getRowCount();
-      currentRow = 0;
+  /** Wrap each Arrow vector of the (reused) root as a Spark column vector, once. */
+  private static ColumnVector[] wrap(VectorSchemaRoot root) {
+    ColumnVector[] columns = new ColumnVector[root.getFieldVectors().size()];
+    int i = 0;
+    for (FieldVector vector : root.getFieldVectors()) {
+      columns[i++] = new ArrowColumnVector(vector);
     }
-    return true;
+    return columns;
   }
 
   @Override
-  public InternalRow get() {
-    return ArrowToInternalRow.convert(root, currentRow);
+  public boolean next() throws IOException {
+    // The root's vectors are reloaded in place each batch; skip empty batches.
+    while (reader.loadNextBatch()) {
+      int rows = root.getRowCount();
+      if (rows > 0) {
+        batch.setNumRows(rows);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  @Override
+  public ColumnarBatch get() {
+    return batch;
   }
 
   @Override
   public void close() throws IOException {
-    // Close in reverse order of acquisition; the reader owns the imported stream.
     try {
       reader.close();
     } finally {

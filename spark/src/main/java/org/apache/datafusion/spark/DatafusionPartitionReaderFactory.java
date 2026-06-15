@@ -23,14 +23,31 @@ import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.read.InputPartition;
 import org.apache.spark.sql.connector.read.PartitionReader;
 import org.apache.spark.sql.connector.read.PartitionReaderFactory;
+import org.apache.spark.sql.vectorized.ColumnarBatch;
 
-/** Creates a row reader per partition. Serialized to executors, so it holds no state. */
+/**
+ * Creates a columnar reader per partition. Serialized to executors, so it holds no state.
+ *
+ * <p>Reads are columnar: {@link #supportColumnarReads} returns true, so Spark calls {@link
+ * #createColumnarReader} and consumes Arrow buffers directly via {@link
+ * DatafusionColumnarPartitionReader}. The row reader is unsupported.
+ */
 final class DatafusionPartitionReaderFactory implements PartitionReaderFactory {
 
   private static final long serialVersionUID = 1L;
 
   @Override
+  public boolean supportColumnarReads(InputPartition partition) {
+    return true;
+  }
+
+  @Override
+  public PartitionReader<ColumnarBatch> createColumnarReader(InputPartition partition) {
+    return new DatafusionColumnarPartitionReader((DatafusionInputPartition) partition);
+  }
+
+  @Override
   public PartitionReader<InternalRow> createReader(InputPartition partition) {
-    return new DatafusionPartitionReader((DatafusionInputPartition) partition);
+    throw new UnsupportedOperationException("datafusion source reads are columnar");
   }
 }
