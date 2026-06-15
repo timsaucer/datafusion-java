@@ -130,6 +130,7 @@ fn listing_csv_scans_rows() {
             EMPTY,
             0,
             0,
+            -1,
             ptr::null(),
             0,
             ptr::null(),

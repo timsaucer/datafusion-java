@@ -29,8 +29,8 @@ use datafusion::arrow::ffi::FFI_ArrowSchema;
 use datafusion::arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 
 use datafusion_scan_ffi::abi::{
-    df_error_free, df_scan_abi_version, df_scan_close, df_scan_create, df_scan_execute_partition,
-    df_scan_partition_count, df_scan_schema, DfScanHandle,
+    df_error_free, df_scan_abi_version, df_scan_close, df_scan_create, df_scan_execute,
+    df_scan_execute_partition, df_scan_partition_count, df_scan_schema, DfScanHandle,
 };
 use datafusion_scan_ffi::ffi_types::{DfBytes, DfStr};
 use datafusion_scan_ffi::{demo, ABI_VERSION};
@@ -139,6 +139,48 @@ fn execute_partition_roundtrips_arrow_c_stream() {
 }
 
 #[test]
+fn limit_caps_row_count() {
+    demo::register();
+    // demo provider has 5 rows across two partitions; cap at 2.
+    let mut handle: *mut DfScanHandle = ptr::null_mut();
+    let mut err: *mut c_char = ptr::null_mut();
+    let status = unsafe {
+        df_scan_create(
+            provider(),
+            EMPTY_BYTES,
+            EMPTY_BYTES,
+            0,
+            0,
+            2, // limit
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            &mut handle,
+            &mut err,
+        )
+    };
+    assert_eq!(status, 0, "err: {:?}", unsafe { take_err(err) });
+
+    // Read the whole plan; the limit must hold across partitions.
+    let mut stream = FFI_ArrowArrayStream::empty();
+    let mut err2: *mut c_char = ptr::null_mut();
+    assert_eq!(
+        unsafe { df_scan_execute(handle, &mut stream, &mut err2) },
+        0,
+        "err: {:?}",
+        unsafe { take_err(err2) }
+    );
+    let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }.expect("import");
+    let rows: usize = reader.map(|b| b.expect("batch").num_rows()).sum();
+    assert_eq!(rows, 2, "limit should cap the scan at 2 rows");
+
+    unsafe { df_scan_close(handle) };
+}
+
+#[test]
 fn close_is_null_safe() {
     unsafe { df_scan_close(ptr::null_mut()) };
 }
@@ -154,6 +196,7 @@ fn create_full_scan() -> *mut DfScanHandle {
             EMPTY_BYTES,
             0,
             0,
+            -1,
             ptr::null(),
             0,
             ptr::null(),

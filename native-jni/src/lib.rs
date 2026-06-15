@@ -96,14 +96,13 @@ fn build_request<'a>(
         ProtoScanRequest::decode(scan_request)
             .map_err(|e| format!("failed to decode ScanRequest: {e}"))?
     };
-    // NOTE: `req.limit` is carried in the proto but not yet applied by the scan
-    // core or the C ABI; wire it through in a follow-up so both consumers agree.
     Ok(ScanRequest {
         provider,
         options: config,
         partition: &[],
         target_partitions: req.target_partitions,
         batch_size: req.batch_size,
+        limit: req.limit.map(|l| l as usize),
         config_overrides: req.config_overrides.into_iter().collect(),
         projection: req.projection,
         filters: req.filters,

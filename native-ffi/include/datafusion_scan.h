@@ -84,9 +84,10 @@ int32_t df_scan_schema(DfStr provider, DfBytes options, DfBytes partition,
 // Plan a scan. On success writes an owned handle to *out_handle (release with
 // df_scan_close). projection is an array of column-name DfStr (empty = all);
 // filters is an array of serialized datafusion.LogicalExprNode DfBytes;
-// target_partitions / batch_size <= 0 keep DataFusion defaults.
+// target_partitions / batch_size <= 0 keep DataFusion defaults; limit < 0 means
+// no row limit.
 int32_t df_scan_create(DfStr provider, DfBytes options, DfBytes partition,
-                       int32_t target_partitions, int32_t batch_size,
+                       int32_t target_partitions, int32_t batch_size, int64_t limit,
                        const DfKeyValue* config_overrides, size_t config_overrides_len,
                        const DfStr* projection, size_t projection_len,
                        const DfBytes* filters, size_t filters_len,

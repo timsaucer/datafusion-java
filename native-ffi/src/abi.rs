@@ -113,10 +113,10 @@ pub unsafe extern "C" fn df_scan_schema(
 /// Plan a scan. On success writes an owned [`DfScanHandle`] pointer to
 /// `*out_handle`; the caller must release it with [`df_scan_close`].
 ///
-/// `config_keys`/`config_values` ... here folded into a single
-/// `config_overrides` array of [`DfKeyValue`]. `projection` is an array of
-/// column-name [`DfStr`]s (empty selects all). `filters` is an array of
-/// serialized `datafusion.LogicalExprNode` [`DfBytes`].
+/// Session config overrides are a single `config_overrides` array of
+/// [`DfKeyValue`]. `projection` is an array of column-name [`DfStr`]s (empty
+/// selects all). `filters` is an array of serialized `datafusion.LogicalExprNode`
+/// [`DfBytes`]. `limit` is the pushed row limit; a negative value means none.
 ///
 /// # Safety
 /// Array args follow the `(ptr, len)` borrow contract; `out_handle` must be a
@@ -129,6 +129,7 @@ pub unsafe extern "C" fn df_scan_create(
     partition: DfBytes,
     target_partitions: c_int,
     batch_size: c_int,
+    limit: i64,
     config_overrides: *const DfKeyValue,
     config_overrides_len: usize,
     projection: *const DfStr,
@@ -163,6 +164,7 @@ pub unsafe extern "C" fn df_scan_create(
             partition: partition.as_slice(),
             target_partitions,
             batch_size,
+            limit: if limit < 0 { None } else { Some(limit as usize) },
             config_overrides: overrides,
             projection: cols,
             filters: filter_bytes,

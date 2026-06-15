@@ -63,6 +63,8 @@ pub struct ScanRequest<'a> {
     pub projection: Vec<String>,
     /// Each entry is a serialized `datafusion.LogicalExprNode`.
     pub filters: Vec<Vec<u8>>,
+    /// Optional row limit pushed into the scan. `None` means no limit.
+    pub limit: Option<usize>,
 }
 
 /// A planned scan. Holds the context alive for the plan's lifetime.
@@ -116,6 +118,9 @@ pub fn create(req: ScanRequest<'_>) -> ScanResult<ScanHandle> {
         let expr = parse_expr(&node, &registry, &DefaultLogicalExtensionCodec {})
             .map_err(|e| ScanError::new(DfStatus::Planning, e.to_string()))?;
         df = df.filter(expr)?;
+    }
+    if let Some(fetch) = req.limit {
+        df = df.limit(0, Some(fetch))?;
     }
 
     // task_ctx() borrows df; capture before create_physical_plan consumes it.

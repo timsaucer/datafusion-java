@@ -164,6 +164,25 @@ class DatafusionScanTest {
     }
   }
 
+  @Test
+  void limitCapsRows() throws Exception {
+    byte[] config = csvConfig(writeCsv());
+    // Pushed limit of 2 over the 3-row CSV.
+    byte[] request = ScanRequest.newBuilder().setLimit(2).build().toByteArray();
+
+    try (BufferAllocator allocator = new RootAllocator();
+        DatafusionScan scan = DatafusionScan.create(PROVIDER, config, request)) {
+      int rows = 0;
+      try (ArrowReader reader = scan.execute(allocator)) {
+        VectorSchemaRoot root = reader.getVectorSchemaRoot();
+        while (reader.loadNextBatch()) {
+          rows += root.getRowCount();
+        }
+      }
+      assertEquals(2, rows, "limit should cap the scan at 2 rows");
+    }
+  }
+
   /** Serialize the LogicalExprNode for {@code id >= value}, as the engine's filter pushdown would. */
   private static byte[] idAtLeast(long value) {
     LogicalExprNode column =
