@@ -35,8 +35,7 @@ fn main() {
     // Honor a caller-provided PROTOC (e.g. a system install) and otherwise fall
     // back to the vendored binary, matching `native/build.rs`.
     if std::env::var_os("PROTOC").is_none() {
-        let protoc =
-            protoc_bin_vendored::protoc_bin_path().expect("vendored protoc not available");
+        let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc not available");
         std::env::set_var("PROTOC", protoc);
     }
     prost_build::compile_protos(PROTOS, &["../proto"]).expect("failed to compile protos");

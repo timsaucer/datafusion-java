@@ -47,7 +47,9 @@ demo-providers = []
 # `arrow::ffi_stream` (FFI_ArrowArrayStream). Same crate+version DataFusion
 # links, so the types unify.
 arrow = { workspace = true }
-datafusion = { workspace = true }
+# `avro` enables AvroFormat for the listing provider; parquet/csv/json/arrow
+# formats are on by default.
+datafusion = { workspace = true, features = ["avro"] }
 # Pushed filters arrive as serialized `datafusion.LogicalExprNode` protobufs --
 # the same vocabulary `datafusion-ffi` already uses, so the encoder is shared
 # with any future Comet path.

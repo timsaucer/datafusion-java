@@ -27,6 +27,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::TableProvider;
 use datafusion::datasource::MemTable;
+use datafusion::prelude::SessionContext;
 
 use crate::error::{DfStatus, ScanError, ScanResult};
 use crate::registry::register_provider;
@@ -41,7 +42,11 @@ pub fn register() {
 
 /// Two-column (`id: Int64`, `name: Utf8`), two-batch in-memory table across
 /// two partitions, so partition-count behavior is observable.
-fn build(_options: &[u8], _partition: &[u8]) -> ScanResult<Arc<dyn TableProvider>> {
+fn build(
+    _ctx: &SessionContext,
+    _options: &[u8],
+    _partition: &[u8],
+) -> ScanResult<Arc<dyn TableProvider>> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("name", DataType::Utf8, true),

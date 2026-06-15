@@ -74,16 +74,19 @@ pub struct ScanHandle {
 
 /// Build the provider via the registry and return its output schema, without
 /// planning. Mirrors #103's `provider_schema_ipc`, but returns the live
-/// `SchemaRef` (the ABI converts it to an Arrow C Schema).
+/// `SchemaRef` (the ABI converts it to an Arrow C Schema). Uses a default
+/// context -- enough for schema inference against the default (local) object
+/// store; a provider needing custom stores should be built through [`create`].
 pub fn schema(provider: &str, options: &[u8], partition: &[u8]) -> ScanResult<SchemaRef> {
-    let provider = build_provider(provider, options, partition)?;
+    let ctx = SessionContext::new();
+    let provider = build_provider(provider, &ctx, options, partition)?;
     Ok(provider.schema())
 }
 
 /// Build, register, project, filter, and plan exactly once.
 pub fn create(req: ScanRequest<'_>) -> ScanResult<ScanHandle> {
-    let provider = build_provider(req.provider, req.options, req.partition)?;
-
+    // Build the context first: a provider may need it (schema inference, object
+    // store access) at construction time.
     let mut config = SessionConfig::new();
     if req.target_partitions > 0 {
         config = config.with_target_partitions(req.target_partitions as usize);
@@ -96,6 +99,7 @@ pub fn create(req: ScanRequest<'_>) -> ScanResult<ScanHandle> {
     }
 
     let ctx = SessionContext::new_with_config(config);
+    let provider = build_provider(req.provider, &ctx, req.options, req.partition)?;
     ctx.register_table(SCAN_TABLE_NAME, provider)?;
 
     let mut df: DataFrame = handle().block_on(ctx.table(SCAN_TABLE_NAME))?;
@@ -153,9 +157,8 @@ impl ScanHandle {
         // execute()-time (RepartitionExec et al.), needing a runtime context.
         let stream = {
             let _guard = handle().enter();
-            plan.execute(partition, task_ctx).map_err(|e| {
-                ScanError::new(DfStatus::Execution, e.to_string())
-            })?
+            plan.execute(partition, task_ctx)
+                .map_err(|e| ScanError::new(DfStatus::Execution, e.to_string()))?
         };
         Ok(StreamingReader { schema, stream })
     }

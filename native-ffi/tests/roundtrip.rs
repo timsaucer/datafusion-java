@@ -68,7 +68,8 @@ fn schema_probe_returns_provider_schema() {
     demo::register();
     let mut out = FFI_ArrowSchema::empty();
     let mut err: *mut c_char = ptr::null_mut();
-    let status = unsafe { df_scan_schema(provider(), EMPTY_BYTES, EMPTY_BYTES, &mut out, &mut err) };
+    let status =
+        unsafe { df_scan_schema(provider(), EMPTY_BYTES, EMPTY_BYTES, &mut out, &mut err) };
     assert_eq!(status, 0, "err: {:?}", unsafe { take_err(err) });
 
     let schema =
@@ -115,8 +116,7 @@ fn execute_partition_roundtrips_arrow_c_stream() {
     for partition in 0..2 {
         let mut stream = FFI_ArrowArrayStream::empty();
         let mut err: *mut c_char = ptr::null_mut();
-        let status =
-            unsafe { df_scan_execute_partition(handle, partition, &mut stream, &mut err) };
+        let status = unsafe { df_scan_execute_partition(handle, partition, &mut stream, &mut err) };
         assert_eq!(status, 0, "err: {:?}", unsafe { take_err(err) });
 
         let reader = unsafe { ArrowArrayStreamReader::from_raw(&mut stream) }

@@ -27,19 +27,28 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use datafusion::catalog::TableProvider;
+use datafusion::prelude::SessionContext;
 
 use crate::error::{DfStatus, ScanError, ScanResult};
 
 /// Builds a provider from caller-supplied bytes.
 ///
+/// * `ctx`       -- the scan's session context, already configured with the
+///   caller's tuning/overrides. A builder that must infer a schema or read an
+///   object store (e.g. a listing table) uses `ctx.state()` for that; simple
+///   in-memory providers ignore it.
 /// * `options`   -- provider-level config (which table, paths, schema, ...).
 /// * `partition` -- optional per-partition slice descriptor; empty for a
 ///   whole-table scan.
 ///
-/// Both are opaque to the ABI; their encoding is a contract between the
-/// registrant and whoever fills the bytes on the other side of the boundary.
-pub type ProviderBuilder =
-    fn(options: &[u8], partition: &[u8]) -> ScanResult<Arc<dyn TableProvider>>;
+/// `options`/`partition` are opaque to the ABI; their encoding is a contract
+/// between the registrant and whoever fills the bytes on the other side of the
+/// boundary (the in-tree builders use [`crate::proto::ScanConfig`]).
+pub type ProviderBuilder = fn(
+    ctx: &SessionContext,
+    options: &[u8],
+    partition: &[u8],
+) -> ScanResult<Arc<dyn TableProvider>>;
 
 fn registry() -> &'static RwLock<HashMap<String, ProviderBuilder>> {
     static REGISTRY: std::sync::OnceLock<RwLock<HashMap<String, ProviderBuilder>>> =
@@ -60,6 +69,7 @@ pub fn register_provider(name: impl Into<String>, builder: ProviderBuilder) {
 /// Look up `name` and build a provider from the given bytes.
 pub fn build_provider(
     name: &str,
+    ctx: &SessionContext,
     options: &[u8],
     partition: &[u8],
 ) -> ScanResult<Arc<dyn TableProvider>> {
@@ -68,7 +78,7 @@ pub fn build_provider(
         guard.get(name).copied()
     };
     match builder {
-        Some(b) => b(options, partition),
+        Some(b) => b(ctx, options, partition),
         None => Err(ScanError::new(
             DfStatus::UnknownProvider,
             format!("no provider builder registered under name {name:?}"),

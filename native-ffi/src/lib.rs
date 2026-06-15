@@ -55,6 +55,7 @@
 pub mod abi;
 pub mod error;
 pub mod ffi_types;
+pub mod listing;
 pub mod reader;
 pub mod registry;
 pub mod runtime;
