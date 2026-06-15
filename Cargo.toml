@@ -21,6 +21,7 @@ members = [
     "native",
     "native-common",
     "native-ffi",
+    "native-jni",
 ]
 
 # Shared package metadata so every crate moves in lock step. Members inherit
