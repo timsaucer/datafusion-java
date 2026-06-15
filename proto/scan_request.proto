@@ -1,0 +1,65 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package datafusion_java;
+
+option java_package = "org.apache.datafusion.protobuf";
+option java_multiple_files = true;
+
+// The pushdown a query engine (Spark DataSourceV2, etc.) captures for a scan.
+//
+// This is the *staging* object the engine populates during planning. It maps
+// onto the typed arguments of `df_scan_create` rather than being passed as a
+// single blob: the JNI shim / FFM layer decodes a ScanRequest and explodes it
+// into the call's `projection` / `filters` / `target_partitions` / ...
+// arguments. Keeping the C ABI's arguments typed (not one opaque protobuf)
+// keeps it FFM-friendly and language-neutral; this message just gives the
+// engine one structured thing to build and serialize across its own layers
+// (e.g. driver -> executor task) before the shim makes the native call.
+//
+// It is deliberately NOT the provider config: which provider and its
+// parameters live in ScanConfig (the `options` blob). A ScanRequest is purely
+// "given that provider, here is what to read."
+message ScanRequest {
+  // Pruned columns to project, by name. Empty selects all columns. Names
+  // match the provider's (pre-widening) output schema.
+  repeated string projection = 1;
+
+  // Pushed filters, each a serialized `datafusion.LogicalExprNode` (the same
+  // encoding `datafusion-ffi` uses). The engine translates whichever of its
+  // own predicates it can express and leaves the rest for itself to apply.
+  // The provider receives them as a conjunction (AND).
+  repeated bytes filters = 2;
+
+  // Optional row limit pushed into the scan. Unset means no limit. Advisory:
+  // the engine must still enforce its own limit, since not every plan honors
+  // it exactly.
+  optional uint64 limit = 3;
+
+  // Execution tuning resolved once on the driver and shipped to every executor
+  // so partition counts stay deterministic. <= 0 leaves the DataFusion
+  // default in place (matches the C ABI's convention).
+  int32 target_partitions = 4;
+  int32 batch_size = 5;
+
+  // Session config overrides applied to the scan's private context, e.g.
+  // {"datafusion.execution.parquet.pushdown_filters": "true"}. Resolved on the
+  // driver alongside the tuning above.
+  map<string, string> config_overrides = 6;
+}

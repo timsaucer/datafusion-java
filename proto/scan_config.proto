@@ -1,0 +1,80 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package datafusion_java;
+
+import "csv_read_options.proto";
+import "json_read_options.proto";
+import "parquet_read_options.proto";
+import "avro_read_options.proto";
+import "arrow_read_options.proto";
+
+option java_package = "org.apache.datafusion.protobuf";
+option java_multiple_files = true;
+
+// Provider configuration carried in the `options` byte blob of the plain-C
+// scan ABI (`df_scan_schema` / `df_scan_create`). The ABI itself treats these
+// bytes as opaque; the registered provider builder named by `provider` decodes
+// them. This message is the encoding the in-tree builders agree on -- a custom
+// builder may ignore it and define its own.
+//
+// `provider` selects the registered builder (e.g. "datafusion.listing",
+// "datafusion.memory"). `source` carries that builder's parameters; `custom`
+// is an escape hatch for builders that define their own wire format.
+message ScanConfig {
+  string provider = 1;
+
+  oneof source {
+    ListingSource listing = 2;
+    bytes custom = 15;
+  }
+}
+
+// A file-backed listing source: one or more paths/URIs read with a single
+// file format. Mirrors DataFusion's ListingTable inputs. Object-store
+// credentials/endpoints are configured out of band (registered on the context
+// by the embedding cdylib), not here.
+message ListingSource {
+  // Files or directories. Globs and object-store URIs (s3://, gs://, ...) are
+  // allowed where the registered object store supports them.
+  repeated string paths = 1;
+
+  // The file format and its read options. Reuses the existing per-format
+  // option messages so encoders are shared with the rest of the binding.
+  oneof format {
+    CsvReadOptionsProto csv = 2;
+    NdJsonReadOptionsProto json = 3;
+    ParquetReadOptionsProto parquet = 4;
+    AvroReadOptionsProto avro = 5;
+    ArrowReadOptionsProto arrow = 6;
+  }
+
+  // Optional explicit schema as Arrow IPC schema-message bytes. Unset lets the
+  // provider infer it (e.g. from Parquet metadata or by sampling).
+  optional bytes schema_ipc = 7;
+}
+
+// Per-partition slice descriptor carried in the `partition` byte blob. Empty
+// for a whole-table scan. `index` lets the driver hand each executor task its
+// slice; `opaque` is builder-defined (e.g. a serialized file group), letting a
+// provider partition however it likes without the ABI knowing the shape.
+message ScanPartition {
+  uint32 index = 1;
+  bytes opaque = 2;
+}
