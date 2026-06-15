@@ -20,6 +20,7 @@ resolver = "2"
 members = [
     "native",
     "native-common",
+    "native-ffi",
 ]
 
 # Shared package metadata so every crate moves in lock step. Members inherit

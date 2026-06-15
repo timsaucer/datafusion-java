@@ -1526,6 +1526,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-scan-ffi"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "datafusion-proto",
+ "datafusion-scan-ffi",
+ "futures",
+ "prost",
+ "tokio",
+]
+
+[[package]]
 name = "datafusion-session"
 version = "53.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
