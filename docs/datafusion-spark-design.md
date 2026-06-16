@@ -208,3 +208,97 @@ Not yet done:
   defaults.
 - **External provider cdylibs (option B).** Loading third-party providers over
   `datafusion-ffi`'s `ForeignTableProvider` is not implemented.
+
+## Alternative / companion front-end: ADBC
+
+A reviewer suggested exposing arbitrary DataFusion `TableProvider`s over
+[ADBC](https://arrow.apache.org/adbc/) (Arrow Database Connectivity) instead of —
+or alongside — this scan ABI. The two are not mutually exclusive: they are two
+front-ends over the same core, serving different consumers.
+
+### What this PR's work reuses
+
+The PR already cleaves at the right seam. Three layers, and the valuable two are
+front-end-agnostic:
+
+| Layer | ADBC reuse |
+| --- | --- |
+| Exec core (`scan.rs`, `reader.rs`, `runtime.rs`) — build provider → register on `SessionContext` → plan → `ExecutionPlan` → partition stream → `FFI_ArrowArrayStream` | **Direct reuse.** Already JVM-free and C-free. |
+| Provider registry (`registry.rs`) — register `TableProvider` by name, build on demand | **Direct reuse.** This *is* the "arbitrary providers" mechanism. |
+| `native-common` (errors, tokio handle); panic→status `catch_unwind` pattern | Reuse concept; ADBC has its own error struct. |
+| `df_scan_*` flat C ABI, proto pushdown (`ScanRequest` / `SparkFilters` / `LogicalExprNode`), JNI shim, `core/scan/*`, `spark/*` | **Not reused.** Scan-, JVM-, and Spark-specific. |
+
+`reader.rs`'s `StreamingReader` (DataFusion `SendableRecordBatchStream` →
+`ArrowArrayStream`) is exactly what ADBC's `AdbcStatementExecuteQuery` returns:
+the data plane is identical, and the cross-implementation Arrow C Stream question
+this PR already answered carries over unchanged.
+
+### What ADBC adds, and what it drops
+
+ADBC mandates a fixed, large C surface — `AdbcDatabase` / `AdbcConnection` /
+`AdbcStatement` lifecycle, option getters/setters, metadata calls, an
+`AdbcDriverInit` entry point. You do **not** hand-write that vtable: the official
+`adbc_core` Rust crate supplies `Database` / `Connection` / `Statement` traits
+plus an `export_driver!` macro that generates the C ABI. So the FFI layer becomes
+trait glue, not a second hand-written boundary.
+
+New work:
+
+- `adbc_core` dependency + three trait impls. `Database` holds config + registered
+  providers; `Connection` wraps a `SessionContext`; `Statement` holds SQL + bound
+  params and, on execute, runs `ctx.sql(q)` → physical plan → the existing
+  `StreamingReader`.
+- Catalog metadata methods (`GetObjects` / `GetTableSchema` / `GetTableTypes` /
+  `GetInfo`) → DataFusion `CatalogProvider` / `SchemaProvider` introspection.
+- ADBC error / status mapping in place of `DfStatus`.
+- Optional: parameter binding / prepared statements; `ExecutePartitions` (maps
+  cleanly onto the existing plan-partition logic); ingest/write (likely out of
+  scope).
+- Driver packaging (a manifest so `adbc_driver_manager` can load the library).
+
+Dropped relative to the Spark path: the protobuf pushdown machinery
+(`ScanRequest`, `SparkFilters`, `LogicalExprNode` encoding) is unneeded — ADBC
+clients send SQL and DataFusion's optimizer does pushdown internally — as are the
+JNI shim, `core/scan`, and the Spark module.
+
+### Suggested layout for both
+
+```
+native-common/        errors, tokio runtime           [shared]
+native-exec-core/     provider registry + plan/exec   [shared]  ← lift scan.rs/reader.rs/registry.rs here
+  ├─ native-ffi/      df_scan_* flat C (+ JNI/Spark)   [exists]
+  └─ native-adbc/     adbc_core trait impls            [new]
+```
+
+One refactor on the existing side: lift `scan.rs` / `reader.rs` / `registry.rs`
+out of `native-ffi` into a shared `native-exec-core` crate that both front-ends
+depend on; `native-ffi` keeps only `abi.rs` + proto. Low churn — those modules
+are already free of C/JVM concerns by design.
+
+### Why keep both rather than collapse to one
+
+Different consumers. `df_scan_*` is a bespoke, scan-only ABI with **explicit**
+pushdown: every consumer hand-binds it, but it can carry Spark's pre-resolved
+predicates without a SQL round-trip. ADBC is a SQL-oriented **standard** ABI:
+bigger mandated surface, but the whole client ecosystem (Python
+`adbc_driver_manager`, R, Go, the JDBC↔ADBC bridge) comes for free.
+
+They are not redundant, because Spark's pre-resolved pushdown does not always
+re-serialize to a SQL string:
+
+- **Lossy but rescuable** (within current filter scope): float/double literals
+  (decimal-text render loses exact IEEE bits), `NaN`/`±Inf` (no SQL literal),
+  decimal precision/scale, binary/non-UTF8 literals, null-safe equality
+  (`<=>` → `IS NOT DISTINCT FROM`), identifier quoting/case. ADBC parameter
+  binding (`WHERE col = ?` with a typed bound value) closes most of the literal
+  cases.
+- **Structurally impossible**: pushdown whose value is not known at
+  statement-prepare time — dynamic partition pruning, runtime/bloom filters from
+  joins — cannot be a static SQL string, and binding does not help because the
+  value arrives mid-execution. This PR pushes none of these yet, but it is the
+  reason a typed-`Expr` scan ABI is not merely a convenience over SQL: it is the
+  only path that can carry runtime filters at all.
+
+So the recommendation is a shared `native-exec-core` with two thin front-ends:
+ADBC for SQL clients across the Arrow ecosystem, the flat-C scan ABI for
+embedders (Spark today) that push pre-resolved or runtime predicates.
