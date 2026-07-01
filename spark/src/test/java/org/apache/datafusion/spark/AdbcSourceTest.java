@@ -146,6 +146,17 @@ class AdbcSourceTest {
             + load(TYPES_TABLE).rdd().getNumPartitions());
   }
 
+  /**
+   * count() over a cast-requiring table. Catalyst prunes the projection to empty for a count, and a
+   * bare {@code SELECT *} would return the raw (uncast) schema -- the reader would then reject a
+   * non-Spark-native column (e.g. {@code Timestamp(NANOSECOND)}). The connector emits a single
+   * readable probe column instead, so the row count still comes back.
+   */
+  @Test
+  void typesCountWorksWithoutMaterializingCastColumns() {
+    assertEquals(3L, load(TYPES_TABLE).count());
+  }
+
   /** Every column decodes to the expected Spark-native value -- casts are value-correct. */
   @Test
   void typesValuesRoundTripThroughCasts() {

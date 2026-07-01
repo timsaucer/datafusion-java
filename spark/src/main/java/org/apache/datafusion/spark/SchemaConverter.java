@@ -114,6 +114,23 @@ final class SchemaConverter {
     return needsCast(field) ? renderArrowType(field) : null;
   }
 
+  /**
+   * A single Spark-readable column for a column-less scan (e.g. {@code count()}, whose projection
+   * Catalyst prunes to empty). Such a scan only needs a row count, but the emitted stream must
+   * still be Spark-native -- a bare {@code SELECT *} would return the raw, uncast schema and the
+   * reader would fail on the first non-Spark-native column. Prefers a column that needs no cast
+   * (cheapest); falls back to the first column with its cast applied when every column needs one.
+   */
+  static ProjectionColumn probeColumn(Schema schema) {
+    for (Field field : schema.getFields()) {
+      if (!needsCast(field)) {
+        return new ProjectionColumn(field.getName(), null);
+      }
+    }
+    Field first = schema.getFields().get(0);
+    return new ProjectionColumn(first.getName(), castTargetString(first));
+  }
+
   // --- Arrow type -> Spark type ---------------------------------------------
 
   static DataType toSparkType(Field field) {

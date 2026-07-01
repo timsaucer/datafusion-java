@@ -108,15 +108,6 @@ final class AdbcScanImpl implements Scan, Batch {
 
       Schema arrow = conn.getTableSchema(null, null, options.table());
 
-      List<SchemaConverter.ProjectionColumn> columns =
-          SchemaConverter.projectionColumns(arrow, projection);
-      boolean anyCast = columns.stream().anyMatch(c -> c.castType() != null);
-      // SELECT * only when no columns are projected away and none need a cast; otherwise the
-      // columns must be listed so the casts can be injected.
-      List<SchemaConverter.ProjectionColumn> sqlColumns =
-          (projection == null && !anyCast) ? null : columns;
-      String sql = SqlQuery.build(options.table(), sqlColumns, pushedFilters, limit);
-
       // The casts (unsigned, Float16, non-µs timestamps, time) live only in the SQL projection, so
       // any schema needing one must use the SQL wire. The gate is the full schema, not just the
       // projection: the Substrait NamedScan declares every field's type, so an unprojected cast
@@ -124,6 +115,23 @@ final class AdbcScanImpl implements Scan, Batch {
       // Spark-native Arrow types (binary, nested, decimal, ...); build() throws for those, which we
       // likewise treat as "not Substrait-representable" and fall back.
       boolean schemaNeedsCast = arrow.getFields().stream().anyMatch(SchemaConverter::needsCast);
+
+      List<SchemaConverter.ProjectionColumn> columns =
+          SchemaConverter.projectionColumns(arrow, projection);
+      // count() (and other column-less reads) prunes the projection to empty. A bare SELECT *
+      // would then return the raw, uncast schema and the reader would fail on a non-Spark-native
+      // column, so when the table has any cast column, emit a single readable probe column
+      // instead -- the row count is all such a scan needs.
+      if (columns.isEmpty() && schemaNeedsCast) {
+        columns = List.of(SchemaConverter.probeColumn(arrow));
+      }
+      boolean anyCast = columns.stream().anyMatch(c -> c.castType() != null);
+      // SELECT * only when no columns are projected away and none need a cast; otherwise the
+      // columns must be listed so the casts can be injected.
+      List<SchemaConverter.ProjectionColumn> sqlColumns =
+          (projection == null && !anyCast) ? null : columns;
+      String sql = SqlQuery.build(options.table(), sqlColumns, pushedFilters, limit);
+
       byte[] substrait = null;
       if (!schemaNeedsCast) {
         try {

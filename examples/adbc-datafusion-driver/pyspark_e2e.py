@@ -120,6 +120,12 @@ try:
     print("cast columns:", sorted(cast_cols))
     assert cast_cols == {"channel", "big", "event_time", "score", "tags"}, cast_cols
 
+    # count() prunes the projection to empty; the connector must not emit a bare SELECT * (which
+    # would return the raw, uncast schema and fail the reader on the ns timestamp / unsigned ids).
+    types_count = dft.count()
+    print("types count:", types_count)
+    assert types_count == 3, types_count
+
     # value correctness: collecting whole rows forces the vectorized reader to decode each
     # ArrowColumnVector, so a bad cast (wrong layout, unit relabel instead of rescale, unsigned
     # overflow) fails here.

@@ -184,6 +184,29 @@ class SchemaConverterTest {
   }
 
   @Test
+  void probeColumnPrefersCastlessThenFallsBackToCast() {
+    // A castless column is preferred (cheapest, no cast) for a column-less scan.
+    Schema mixed =
+        new Schema(
+            List.of(
+                Field.nullable("channel", new ArrowType.Int(16, false)),
+                Field.nullable("id", new ArrowType.Int(64, true))));
+    ProjectionColumn probe = SchemaConverter.probeColumn(mixed);
+    assertEquals("id", probe.name());
+    assertNull(probe.castType());
+
+    // When every column needs a cast, the first column is used with its cast applied.
+    Schema allCast =
+        new Schema(
+            List.of(
+                Field.nullable("channel", new ArrowType.Int(16, false)),
+                Field.nullable("ts", new ArrowType.Timestamp(TimeUnit.NANOSECOND, null))));
+    ProjectionColumn casted = SchemaConverter.probeColumn(allCast);
+    assertEquals("channel", casted.name());
+    assertEquals("Int32", casted.castType());
+  }
+
+  @Test
   void projectionColumnsCarryCastTargets() {
     Schema schema =
         new Schema(
