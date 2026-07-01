@@ -166,6 +166,28 @@ class SchemaConverterTest {
     assertEquals("List(Int32)", SchemaConverter.castTargetString(list));
   }
 
+  @Test
+  void fixedSizeListCastsToVariableList() {
+    // Spark reads ArrayType only from a variable ListVector, so a fixed-size list is always cast
+    // to a variable list -- even when its element needs no cast.
+    Field intFixed =
+        new Field(
+            "v",
+            FieldType.nullable(new ArrowType.FixedSizeList(2)),
+            List.of(nullable("item", new ArrowType.Int(32, true))));
+    assertEquals(DataTypes.createArrayType(DataTypes.IntegerType, true), spark(intFixed));
+    assertEquals("List(Int32)", SchemaConverter.castTargetString(intFixed));
+
+    // The element is rendered cast-aware: FixedSizeList<Float16> -> List(Float32).
+    Field halfFixed =
+        new Field(
+            "v",
+            FieldType.nullable(new ArrowType.FixedSizeList(3)),
+            List.of(nullable("item", new ArrowType.FloatingPoint(FloatingPointPrecision.HALF))));
+    assertEquals(DataTypes.createArrayType(DataTypes.FloatType, true), spark(halfFixed));
+    assertEquals("List(Float32)", SchemaConverter.castTargetString(halfFixed));
+  }
+
   // --- schema-level: metadata flag + projection planning -------------------
 
   @Test

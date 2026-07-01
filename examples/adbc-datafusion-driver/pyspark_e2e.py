@@ -118,7 +118,7 @@ try:
     # cast columns are flagged (so filter pushdown stays off them); pass-through ones are not.
     cast_cols = {f.name for f in dft.schema.fields if f.metadata.get(CAST_META_KEY)}
     print("cast columns:", sorted(cast_cols))
-    assert cast_cols == {"channel", "big", "event_time", "score", "tags"}, cast_cols
+    assert cast_cols == {"channel", "big", "event_time", "score", "tags", "vec"}, cast_cols
 
     # count() prunes the projection to empty; the connector must not emit a bare SELECT * (which
     # would return the raw, uncast schema and fail the reader on the ns timestamp / unsigned ids).
@@ -157,6 +157,11 @@ try:
     assert r1["tags"] == [1, 2]
     assert r2["tags"] == []
     assert r3["tags"] == [3]
+
+    # FixedSizeList<UInt16> -> Array<Integer> (fixed->variable + element widening)
+    assert r1["vec"] == [10, 20]
+    assert r2["vec"] == [30, 40]
+    assert r3["vec"] == [50, 60]
 
     # nested List<Struct<key,val>> passes through
     assert [(x["key"], x["val"]) for x in r1["attrs"]] == [("a", "1")]

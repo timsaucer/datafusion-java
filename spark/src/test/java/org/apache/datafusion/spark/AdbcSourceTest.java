@@ -120,6 +120,9 @@ class AdbcSourceTest {
     assertEquals(DataTypes.FloatType, schema.apply("score").dataType());
     assertEquals(
         DataTypes.createArrayType(DataTypes.IntegerType, true), schema.apply("tags").dataType());
+    // FixedSizeList<UInt16> -> variable Array<Integer> (fixed layout not readable by Spark).
+    assertEquals(
+        DataTypes.createArrayType(DataTypes.IntegerType, true), schema.apply("vec").dataType());
 
     // Cast columns are flagged (so filter pushdown stays off them); pass-through columns are not.
     assertTrue(schema.apply("channel").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
@@ -127,6 +130,7 @@ class AdbcSourceTest {
     assertTrue(schema.apply("event_time").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertTrue(schema.apply("score").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertTrue(schema.apply("tags").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("vec").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertFalse(schema.apply("payload").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertFalse(schema.apply("attrs").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
   }
@@ -196,6 +200,11 @@ class AdbcSourceTest {
     assertEquals(List.of(1, 2), r1.getList(r1.fieldIndex("tags")));
     assertEquals(List.of(), r2.getList(r2.fieldIndex("tags")));
     assertEquals(List.of(3), r3.getList(r3.fieldIndex("tags")));
+
+    // FixedSizeList<UInt16> -> Array<Integer> (fixed->variable + element widening).
+    assertEquals(List.of(10, 20), r1.getList(r1.fieldIndex("vec")));
+    assertEquals(List.of(30, 40), r2.getList(r2.fieldIndex("vec")));
+    assertEquals(List.of(50, 60), r3.getList(r3.fieldIndex("vec")));
 
     // nested List<Struct<key,val>> passes through.
     List<Row> attrs3 = r3.getList(r3.fieldIndex("attrs"));

@@ -48,8 +48,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    ArrayRef, BinaryArray, Float16Array, Int64Array, ListBuilder, StringArray, StringBuilder,
-    StructBuilder, TimestampNanosecondArray, UInt16Array, UInt16Builder, UInt64Array,
+    ArrayRef, BinaryArray, FixedSizeListBuilder, Float16Array, Int64Array, ListBuilder,
+    StringArray, StringBuilder, StructBuilder, TimestampNanosecondArray, UInt16Array,
+    UInt16Builder, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -145,6 +146,9 @@ struct Row {
     event_time: i64,
     score: f32,
     tags: &'static [u16],
+    /// A fixed-size list of two unsigned ints -- Spark cannot read FixedSizeList and must have it
+    /// cast to a variable List (with the element widened). Always length 2.
+    vec: [u16; 2],
 }
 
 // Values are chosen to exercise the widening edges: channel spans past i16::MAX, big includes
@@ -161,6 +165,7 @@ const TYPE_ROWS: [Row; 3] = [
         event_time: 1_600_000_000_000_000_000, // 2020-09-13
         score: 1.5,
         tags: &[1, 2],
+        vec: [10, 20],
     },
     Row {
         id: 2,
@@ -172,6 +177,7 @@ const TYPE_ROWS: [Row; 3] = [
         event_time: 1_610_000_000_000_000_000, // 2021-01-07
         score: 2.5,
         tags: &[],
+        vec: [30, 40],
     },
     Row {
         id: 3,
@@ -183,6 +189,7 @@ const TYPE_ROWS: [Row; 3] = [
         event_time: 1_620_000_000_000_000_000, // 2021-05-03
         score: 3.5,
         tags: &[3],
+        vec: [50, 60],
     },
 ];
 
@@ -209,6 +216,7 @@ impl TypesTableProvider {
             Field::new("event_time", proto[6].data_type().clone(), true),
             Field::new("score", proto[7].data_type().clone(), true),
             Field::new("tags", proto[8].data_type().clone(), true),
+            Field::new("vec", proto[9].data_type().clone(), true),
         ]));
 
         // One self-contained single-row batch per partition (see the module docs on why we do
@@ -257,13 +265,19 @@ impl TableProvider for TypesTableProvider {
     }
 }
 
-/// Build the nine single-row column arrays for one [`Row`], in schema order.
+/// Build the ten single-row column arrays for one [`Row`], in schema order.
 fn row_columns(row: &Row) -> Vec<ArrayRef> {
     let mut tags = ListBuilder::new(UInt16Builder::new());
     for t in row.tags {
         tags.values().append_value(*t);
     }
     tags.append(true);
+
+    let mut vec = FixedSizeListBuilder::new(UInt16Builder::new(), row.vec.len() as i32);
+    for v in row.vec {
+        vec.values().append_value(v);
+    }
+    vec.append(true);
 
     let attr_fields = vec![
         Field::new("key", DataType::Utf8, true),
@@ -292,5 +306,6 @@ fn row_columns(row: &Row) -> Vec<ArrayRef> {
         Arc::new(TimestampNanosecondArray::from(vec![row.event_time])),
         Arc::new(Float16Array::from(vec![f16::from_f32(row.score)])),
         Arc::new(tags.finish()) as ArrayRef,
+        Arc::new(vec.finish()) as ArrayRef,
     ]
 }

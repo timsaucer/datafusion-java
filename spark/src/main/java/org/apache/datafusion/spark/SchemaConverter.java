@@ -242,6 +242,11 @@ final class SchemaConverter {
     if (type instanceof ArrowType.Time) {
       return true;
     }
+    // Spark's ArrowColumnVector backs ArrayType only from a variable ListVector, never a
+    // FixedSizeListVector, so a fixed-size list must always be cast to a variable list.
+    if (type instanceof ArrowType.FixedSizeList) {
+      return true;
+    }
     for (Field child : field.getChildren()) {
       if (needsCast(child)) {
         return true;
@@ -325,12 +330,10 @@ final class SchemaConverter {
     if (type instanceof ArrowType.LargeList) {
       return "LargeList(" + listChild(field.getChildren().get(0)) + ")";
     }
-    if (type instanceof ArrowType.FixedSizeList fsl) {
-      return "FixedSizeList("
-          + fsl.getListSize()
-          + " x "
-          + listChild(field.getChildren().get(0))
-          + ")";
+    if (type instanceof ArrowType.FixedSizeList) {
+      // Cast to a variable list: Spark can only read ArrayType from a ListVector. The element is
+      // rendered cast-aware, so e.g. FixedSizeList<Float16> becomes List(Float32).
+      return "List(" + listChild(field.getChildren().get(0)) + ")";
     }
     if (type instanceof ArrowType.Struct) {
       StringBuilder sb = new StringBuilder("Struct(");
