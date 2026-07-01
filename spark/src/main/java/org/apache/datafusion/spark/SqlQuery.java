@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.OptionalLong;
 import java.util.stream.Collectors;
 
+import org.apache.datafusion.spark.SchemaConverter.ProjectionColumn;
 import org.apache.spark.sql.sources.And;
 import org.apache.spark.sql.sources.EqualTo;
 import org.apache.spark.sql.sources.Filter;
@@ -46,18 +47,22 @@ import org.apache.spark.sql.sources.Or;
  *
  * <p>Identifiers are double-quoted (ANSI, DataFusion's default) and string literals single-quoted,
  * both with doubling-based escaping.
+ *
+ * <p>Columns whose source Arrow type is not Spark-native (see {@link SchemaConverter#needsCast})
+ * are wrapped in {@code arrow_cast(col, '<arrow type>')} and re-aliased to their original name, so
+ * the scan emits Spark-native Arrow and the output column names still match the reported schema.
  */
 final class SqlQuery {
 
   private SqlQuery() {}
 
   static String build(
-      String table, List<String> projection, List<Filter> filters, OptionalLong limit) {
+      String table, List<ProjectionColumn> columns, List<Filter> filters, OptionalLong limit) {
     StringBuilder sql = new StringBuilder("SELECT ");
-    if (projection == null || projection.isEmpty()) {
+    if (columns == null || columns.isEmpty()) {
       sql.append("*");
     } else {
-      sql.append(projection.stream().map(SqlQuery::quoteId).collect(Collectors.joining(", ")));
+      sql.append(columns.stream().map(SqlQuery::column).collect(Collectors.joining(", ")));
     }
     sql.append(" FROM ").append(quoteId(table));
     if (!filters.isEmpty()) {
@@ -68,6 +73,14 @@ final class SqlQuery {
       sql.append(" LIMIT ").append(limit.getAsLong());
     }
     return sql.toString();
+  }
+
+  private static String column(ProjectionColumn c) {
+    if (c.castType() == null) {
+      return quoteId(c.name());
+    }
+    // arrow_cast renames its output, so alias back to the source name.
+    return "arrow_cast(" + quoteId(c.name()) + ", '" + c.castType() + "') AS " + quoteId(c.name());
   }
 
   private static String predicate(Filter f) {

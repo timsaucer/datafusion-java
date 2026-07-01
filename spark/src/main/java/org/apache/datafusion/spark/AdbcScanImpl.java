@@ -107,9 +107,31 @@ final class AdbcScanImpl implements Scan, Batch {
       applyTargetPartitions(conn, targetPartitions);
 
       Schema arrow = conn.getTableSchema(null, null, options.table());
-      byte[] substrait =
-          SubstraitPlan.build(options.table(), arrow, projection, pushedFilters, limit);
-      String sql = SqlQuery.build(options.table(), projection, pushedFilters, limit);
+
+      List<SchemaConverter.ProjectionColumn> columns =
+          SchemaConverter.projectionColumns(arrow, projection);
+      boolean anyCast = columns.stream().anyMatch(c -> c.castType() != null);
+      // SELECT * only when no columns are projected away and none need a cast; otherwise the
+      // columns must be listed so the casts can be injected.
+      List<SchemaConverter.ProjectionColumn> sqlColumns =
+          (projection == null && !anyCast) ? null : columns;
+      String sql = SqlQuery.build(options.table(), sqlColumns, pushedFilters, limit);
+
+      // The casts (unsigned, Float16, non-µs timestamps, time) live only in the SQL projection, so
+      // any schema needing one must use the SQL wire. The gate is the full schema, not just the
+      // projection: the Substrait NamedScan declares every field's type, so an unprojected cast
+      // column would still misdeclare the base schema. Substrait also can't encode several other
+      // Spark-native Arrow types (binary, nested, decimal, ...); build() throws for those, which we
+      // likewise treat as "not Substrait-representable" and fall back.
+      boolean schemaNeedsCast = arrow.getFields().stream().anyMatch(SchemaConverter::needsCast);
+      byte[] substrait = null;
+      if (!schemaNeedsCast) {
+        try {
+          substrait = SubstraitPlan.build(options.table(), arrow, projection, pushedFilters, limit);
+        } catch (RuntimeException e) {
+          substrait = null;
+        }
+      }
       return plan(conn, substrait, sql);
     } catch (Exception e) {
       throw new RuntimeException("failed to plan ADBC scan for table " + options.table(), e);
@@ -139,9 +161,11 @@ final class AdbcScanImpl implements Scan, Batch {
     Kind singleKind;
     byte[] singlePayload;
 
-    // Escape hatch: force the SQL wire (e.g. when the Substrait round-trip plans
-    // to fewer partitions than SQL). Defaults to preferring Substrait.
-    boolean forceSql = "sql".equalsIgnoreCase(System.getProperty("adbc.wire", ""));
+    // Force the SQL wire when Substrait can't encode this scan (null plan), or via the escape
+    // hatch (e.g. when the Substrait round-trip plans to fewer partitions than SQL). Defaults to
+    // preferring Substrait.
+    boolean forceSql =
+        substrait == null || "sql".equalsIgnoreCase(System.getProperty("adbc.wire", ""));
 
     AdbcStatement stmt = conn.createStatement();
     try {

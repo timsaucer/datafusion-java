@@ -19,20 +19,28 @@
 
 package org.apache.datafusion.spark;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.arrow.adbc.core.TypedKey;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
+import org.apache.spark.sql.types.DataTypes;
+import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -57,6 +65,8 @@ class AdbcSourceTest {
 
   private static final String ENTRYPOINT = "AdbcDatafusionExampleInit";
   private static final String TABLE = "example";
+  // A second table whose schema spans the Arrow types the connector maps or casts.
+  private static final String TYPES_TABLE = "types";
 
   private static SparkSession spark;
   private static String driverPath;
@@ -80,13 +90,113 @@ class AdbcSourceTest {
   }
 
   private Dataset<Row> load() {
+    return load(TABLE);
+  }
+
+  private Dataset<Row> load(String table) {
     return spark
         .read()
         .format("adbc-datafusion")
         .option("driver", driverPath)
         .option("entrypoint", ENTRYPOINT)
-        .option("table", TABLE)
+        .option("table", table)
         .load();
+  }
+
+  /**
+   * The {@code types} table exercises the full converter: directly-representable columns pass
+   * through, cast-required columns (unsigned, ns timestamp, Float16, nested {@code List<UInt16>})
+   * are cast to a Spark-native layout by a source-side {@code arrow_cast} pushed into the scan.
+   * This asserts the reported Spark types and the cast-column metadata flags.
+   */
+  @Test
+  void typesSchemaMapsAndFlagsCasts() {
+    StructType schema = load(TYPES_TABLE).schema();
+
+    assertEquals(DataTypes.BinaryType, schema.apply("payload").dataType());
+    assertEquals(DataTypes.IntegerType, schema.apply("channel").dataType());
+    assertEquals(DataTypes.createDecimalType(20, 0), schema.apply("big").dataType());
+    assertEquals(DataTypes.TimestampNTZType, schema.apply("event_time").dataType());
+    assertEquals(DataTypes.FloatType, schema.apply("score").dataType());
+    assertEquals(
+        DataTypes.createArrayType(DataTypes.IntegerType, true), schema.apply("tags").dataType());
+
+    // Cast columns are flagged (so filter pushdown stays off them); pass-through columns are not.
+    assertTrue(schema.apply("channel").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("big").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("event_time").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("score").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("tags").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertFalse(schema.apply("payload").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertFalse(schema.apply("attrs").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+  }
+
+  /**
+   * The cast-requiring scan still parallelizes. Casts force the SQL wire (Substrait can't encode
+   * unsigned/Float16), but ADBC {@code executePartitioned} is wire-independent -- it partitions on
+   * the physical plan's output partitioning, and the source-side {@code arrow_cast} is a
+   * partition-preserving projection -- so the {@code types} scan gets one Spark partition per
+   * driver partition, exactly like the Substrait-wire {@code example} scan.
+   */
+  @Test
+  void typesScanIsMultiPartitionDespiteCasts() {
+    assertTrue(
+        load(TYPES_TABLE).rdd().getNumPartitions() >= 2,
+        "expected multiple Spark partitions for the cast (SQL-wire) scan, got "
+            + load(TYPES_TABLE).rdd().getNumPartitions());
+  }
+
+  /** Every column decodes to the expected Spark-native value -- casts are value-correct. */
+  @Test
+  void typesValuesRoundTripThroughCasts() {
+    Map<Long, Row> byId =
+        load(TYPES_TABLE).collectAsList().stream()
+            .collect(Collectors.toMap(r -> r.getLong(r.fieldIndex("id")), r -> r));
+    assertEquals(Set.of(1L, 2L, 3L), byId.keySet());
+    Row r1 = byId.get(1L);
+    Row r2 = byId.get(2L);
+    Row r3 = byId.get(3L);
+
+    // unsigned UInt16 -> Integer, widened past i16::MAX.
+    assertEquals(100, r1.getInt(r1.fieldIndex("channel")));
+    assertEquals(40_000, r2.getInt(r2.fieldIndex("channel")));
+    assertEquals(65_535, r3.getInt(r3.fieldIndex("channel")));
+
+    // unsigned UInt64 -> Decimal(20,0): lossless for values past i64::MAX (a Long would overflow).
+    assertEquals(0, new BigDecimal("18446744073709551615").compareTo(bigValue(r1)));
+    assertEquals(0, BigDecimal.ZERO.compareTo(bigValue(r2)));
+    assertEquals(0, new BigDecimal("9223372036854775808").compareTo(bigValue(r3)));
+
+    // nanosecond Timestamp -> microsecond TimestampNTZ, rescaled (a relabel would land near 1970).
+    assertEquals(LocalDateTime.of(2020, 9, 13, 12, 26, 40), r1.getAs("event_time"));
+    assertEquals(LocalDateTime.of(2021, 1, 7, 6, 13, 20), r2.getAs("event_time"));
+    assertEquals(LocalDateTime.of(2021, 5, 3, 0, 0, 0), r3.getAs("event_time"));
+
+    // Float16 -> Float.
+    assertEquals(1.5f, r1.getFloat(r1.fieldIndex("score")));
+    assertEquals(2.5f, r2.getFloat(r2.fieldIndex("score")));
+
+    // Binary passes through.
+    assertArrayEquals(new byte[] {0x01, 0x02}, (byte[]) r1.getAs("payload"));
+    assertArrayEquals(new byte[] {}, (byte[]) r2.getAs("payload"));
+    assertArrayEquals(new byte[] {(byte) 0xff, (byte) 0xfe}, (byte[]) r3.getAs("payload"));
+
+    // nested List<UInt16> -> Array<Integer> (recursive cast).
+    assertEquals(List.of(1, 2), r1.getList(r1.fieldIndex("tags")));
+    assertEquals(List.of(), r2.getList(r2.fieldIndex("tags")));
+    assertEquals(List.of(3), r3.getList(r3.fieldIndex("tags")));
+
+    // nested List<Struct<key,val>> passes through.
+    List<Row> attrs3 = r3.getList(r3.fieldIndex("attrs"));
+    assertEquals(2, attrs3.size());
+    assertEquals("b", attrs3.get(0).getAs("key"));
+    assertEquals("2", attrs3.get(0).getAs("val"));
+    assertEquals("c", attrs3.get(1).getAs("key"));
+    assertEquals(List.of(), r2.getList(r2.fieldIndex("attrs")));
+  }
+
+  private static BigDecimal bigValue(Row row) {
+    return row.getDecimal(row.fieldIndex("big"));
   }
 
   @Test

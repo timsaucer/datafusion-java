@@ -35,11 +35,17 @@ Configure via env vars (defaults assume this repo's build layout):
   ADBC_DRIVER_LIB path to libadbc_datafusion_example_driver.{dylib,so}
 """
 
+import datetime
 import glob
 import os
 import sys
+from decimal import Decimal
 
 from pyspark.sql import SparkSession
+
+# Field metadata flag the connector sets on columns it casts source-side to a Spark-native
+# layout (SchemaConverter.CAST_METADATA_KEY).
+CAST_META_KEY = "org.apache.datafusion.spark.adbc.cast"
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LIBEXT = "dylib" if sys.platform == "darwin" else "so"
@@ -72,16 +78,21 @@ spark = (
     .getOrCreate()
 )
 
-try:
-    df = (
+def read(table):
+    return (
         spark.read.format("adbc-datafusion")
         .option("driver", driver_lib)
         .option("entrypoint", "AdbcDatafusionExampleInit")
-        .option("table", "example")
+        .option("table", table)
         .load()
     )
 
-    print("=== schema ===")
+
+try:
+    # --- `example`: two Spark-native columns, three partitions -------------------------------
+    df = read("example")
+
+    print("=== example schema ===")
     df.printSchema()
 
     num_partitions = df.rdd.getNumPartitions()
@@ -99,6 +110,58 @@ try:
     assert filtered == [2, 3], filtered
     assert num_partitions >= 2, f"expected multi-partition, got {num_partitions}"
 
-    print("\nPYSPARK E2E OK (multi-partition + projection + filter pushdown)")
+    # --- `types`: the schema-conversion + source-side arrow_cast coverage --------------------
+    dft = read("types")
+    print("=== types schema ===")
+    dft.printSchema()
+
+    # cast columns are flagged (so filter pushdown stays off them); pass-through ones are not.
+    cast_cols = {f.name for f in dft.schema.fields if f.metadata.get(CAST_META_KEY)}
+    print("cast columns:", sorted(cast_cols))
+    assert cast_cols == {"channel", "big", "event_time", "score", "tags"}, cast_cols
+
+    # value correctness: collecting whole rows forces the vectorized reader to decode each
+    # ArrowColumnVector, so a bad cast (wrong layout, unit relabel instead of rescale, unsigned
+    # overflow) fails here.
+    rows = {r["id"]: r for r in dft.collect()}
+    r1, r2, r3 = rows[1], rows[2], rows[3]
+
+    # unsigned UInt16 -> Integer, widened past i16::MAX
+    assert [r1["channel"], r2["channel"], r3["channel"]] == [100, 40000, 65535]
+
+    # unsigned UInt64 -> Decimal(20,0): lossless for values past i64::MAX (a Long would overflow)
+    assert r1["big"] == Decimal("18446744073709551615")
+    assert r2["big"] == Decimal(0)
+    assert r3["big"] == Decimal("9223372036854775808")
+
+    # nanosecond Timestamp -> microsecond TimestampNTZ, rescaled (not relabeled -> would be ~1970)
+    assert r1["event_time"] == datetime.datetime(2020, 9, 13, 12, 26, 40)
+    assert r2["event_time"] == datetime.datetime(2021, 1, 7, 6, 13, 20)
+    assert r3["event_time"] == datetime.datetime(2021, 5, 3, 0, 0, 0)
+
+    # Float16 -> Float
+    assert [r1["score"], r2["score"], r3["score"]] == [1.5, 2.5, 3.5]
+
+    # Binary passes through
+    assert bytes(r1["payload"]) == b"\x01\x02"
+    assert bytes(r2["payload"]) == b""
+    assert bytes(r3["payload"]) == b"\xff\xfe"
+
+    # nested List<UInt16> -> Array<Integer> (recursive cast)
+    assert r1["tags"] == [1, 2]
+    assert r2["tags"] == []
+    assert r3["tags"] == [3]
+
+    # nested List<Struct<key,val>> passes through
+    assert [(x["key"], x["val"]) for x in r1["attrs"]] == [("a", "1")]
+    assert r2["attrs"] == []
+    assert [(x["key"], x["val"]) for x in r3["attrs"]] == [("b", "2"), ("c", "3")]
+
+    # --- filter on a cast column: excluded from pushdown, evaluated by Spark on the cast value -
+    channel_gt = sorted(r["id"] for r in dft.filter(dft.channel > 100).collect())
+    print("filter channel>100 ids:", channel_gt)
+    assert channel_gt == [2, 3], channel_gt
+
+    print("\nPYSPARK E2E OK (example: multi-partition + pushdown; types: casts + nested + filter)")
 finally:
     spark.stop()

@@ -37,6 +37,8 @@ adbc_core = "0.23"
 adbc_ffi = "0.23"
 datafusion = "53"
 async-trait = "0.1"
+# For building Float16 example data (arrow's half-precision element type).
+half = "2"
 
 # Build both an rlib (so the provider/driver can be unit-tested or embedded) and
 # a cdylib (the artifact the arrow-adbc Java driver manager loads at runtime).

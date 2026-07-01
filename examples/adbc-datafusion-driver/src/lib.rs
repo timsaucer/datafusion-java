@@ -39,7 +39,7 @@ use adbc_core::Driver;
 use adbc_driver_datafusion::{ContextInit, DataFusionDatabase, DataFusionDriver};
 use datafusion::prelude::SessionContext;
 
-pub use provider::ExampleTableProvider;
+pub use provider::{ExampleTableProvider, TypesTableProvider};
 
 /// An ADBC driver that registers [`ExampleTableProvider`] into each session.
 ///
@@ -56,6 +56,13 @@ impl Default for ExampleDriver {
             ctx.register_table(
                 ExampleTableProvider::TABLE_NAME,
                 Arc::new(ExampleTableProvider::new()),
+            )?;
+            // A second table whose schema spans the Arrow types the Spark connector must cast
+            // or map (unsigned, ns timestamp, binary, nested list/struct); the E2E test scans
+            // it to check schema conversion and source-side arrow_cast with known values.
+            ctx.register_table(
+                TypesTableProvider::TABLE_NAME,
+                Arc::new(TypesTableProvider::new()),
             )?;
             Ok(())
         });

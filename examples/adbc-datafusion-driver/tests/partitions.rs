@@ -35,8 +35,11 @@ fn execute_partitions_then_read_each_partition() {
 
     // Plan the scan; the provider has three partitions.
     let mut stmt = conn.new_statement().expect("new_statement");
-    stmt.set_sql_query(format!("SELECT id, name FROM {}", ExampleTableProvider::TABLE_NAME))
-        .expect("set_sql_query");
+    stmt.set_sql_query(format!(
+        "SELECT id, name FROM {}",
+        ExampleTableProvider::TABLE_NAME
+    ))
+    .expect("set_sql_query");
     let result = stmt.execute_partitions().expect("execute_partitions");
 
     assert!(
@@ -64,5 +67,9 @@ fn execute_partitions_then_read_each_partition() {
     }
 
     ids.sort();
-    assert_eq!(ids, vec![1, 2, 3], "every row read exactly once across partitions");
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "every row read exactly once across partitions"
+    );
 }

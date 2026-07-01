@@ -21,6 +21,7 @@ package org.apache.datafusion.spark;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.OptionalLong;
 import java.util.Set;
@@ -31,6 +32,7 @@ import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
 import org.apache.spark.sql.connector.read.SupportsPushDownLimit;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 
 /**
@@ -68,7 +70,15 @@ final class AdbcScanBuilder
 
   @Override
   public Filter[] pushFilters(Filter[] filters) {
-    Set<String> columns = Set.of(fullSchema.fieldNames());
+    // Push filters only against Spark-native (non-cast) columns: a cast column is cast in the
+    // scan projection, but a pushed predicate runs against the pre-cast source column, so its
+    // Spark-domain literal would not match. Those filters are left to Spark (see SchemaConverter).
+    Set<String> columns = new LinkedHashSet<>(Arrays.asList(fullSchema.fieldNames()));
+    for (StructField field : fullSchema.fields()) {
+      if (field.metadata().contains(SchemaConverter.CAST_METADATA_KEY)) {
+        columns.remove(field.name());
+      }
+    }
     List<Filter> pushable = new ArrayList<>();
     List<Filter> residual = new ArrayList<>();
     for (Filter f : filters) {
