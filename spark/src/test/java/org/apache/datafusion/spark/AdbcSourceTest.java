@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -79,7 +80,14 @@ class AdbcSourceTest {
         "set -Dadbc.example.driver.path to the example driver cdylib to run this test");
     // local[8]: several task slots in one executor JVM, so the per-executor connection cache
     // (AdbcConnectionPool) is exercised across concurrent tasks.
-    spark = SparkSession.builder().appName("adbc-source-test").master("local[8]").getOrCreate();
+    // Java 8 date/time API: DateType -> java.time.LocalDate, avoiding Spark's legacy
+    // java.sql.Date conversion which needs sun.util.calendar opened on JDK 17.
+    spark =
+        SparkSession.builder()
+            .appName("adbc-source-test")
+            .master("local[8]")
+            .config("spark.sql.datetime.java8API.enabled", "true")
+            .getOrCreate();
   }
 
   @AfterAll
@@ -123,6 +131,11 @@ class AdbcSourceTest {
     // FixedSizeList<UInt16> -> variable Array<Integer> (fixed layout not readable by Spark).
     assertEquals(
         DataTypes.createArrayType(DataTypes.IntegerType, true), schema.apply("vec").dataType());
+    // LargeList<Utf8> -> Array<String>; FixedSizeBinary -> Binary; Date64 -> Date.
+    assertEquals(
+        DataTypes.createArrayType(DataTypes.StringType, true), schema.apply("labels").dataType());
+    assertEquals(DataTypes.BinaryType, schema.apply("digest").dataType());
+    assertEquals(DataTypes.DateType, schema.apply("day").dataType());
 
     // Cast columns are flagged (so filter pushdown stays off them); pass-through columns are not.
     assertTrue(schema.apply("channel").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
@@ -131,6 +144,9 @@ class AdbcSourceTest {
     assertTrue(schema.apply("score").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertTrue(schema.apply("tags").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertTrue(schema.apply("vec").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("labels").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("digest").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
+    assertTrue(schema.apply("day").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertFalse(schema.apply("payload").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
     assertFalse(schema.apply("attrs").metadata().contains(SchemaConverter.CAST_METADATA_KEY));
   }
@@ -206,6 +222,22 @@ class AdbcSourceTest {
     assertEquals(List.of(30, 40), r2.getList(r2.fieldIndex("vec")));
     assertEquals(List.of(50, 60), r3.getList(r3.fieldIndex("vec")));
 
+    // LargeList<Utf8> -> Array<String> (large list not readable -> cast to variable list).
+    assertEquals(List.of("a", "b"), r1.getList(r1.fieldIndex("labels")));
+    assertEquals(List.of(), r2.getList(r2.fieldIndex("labels")));
+    assertEquals(List.of("c"), r3.getList(r3.fieldIndex("labels")));
+
+    // FixedSizeBinary -> Binary.
+    assertArrayEquals(new byte[] {0x01, 0x02, 0x03, 0x04}, (byte[]) r1.getAs("digest"));
+    assertArrayEquals(
+        new byte[] {(byte) 0xff, (byte) 0xfe, (byte) 0xfd, (byte) 0xfc},
+        (byte[]) r3.getAs("digest"));
+
+    // Date64 -> Date32 (day-aligned).
+    assertEquals(LocalDate.ofEpochDay(18518), toLocalDate(r1.getAs("day")));
+    assertEquals(LocalDate.ofEpochDay(18634), toLocalDate(r2.getAs("day")));
+    assertEquals(LocalDate.ofEpochDay(18750), toLocalDate(r3.getAs("day")));
+
     // nested List<Struct<key,val>> passes through.
     List<Row> attrs3 = r3.getList(r3.fieldIndex("attrs"));
     assertEquals(2, attrs3.size());
@@ -217,6 +249,11 @@ class AdbcSourceTest {
 
   private static BigDecimal bigValue(Row row) {
     return row.getDecimal(row.fieldIndex("big"));
+  }
+
+  /** Spark returns DateType as java.sql.Date, or java.time.LocalDate under the Java 8 date API. */
+  private static LocalDate toLocalDate(Object value) {
+    return value instanceof LocalDate d ? d : ((java.sql.Date) value).toLocalDate();
   }
 
   @Test

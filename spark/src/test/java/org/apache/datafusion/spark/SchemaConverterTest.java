@@ -21,12 +21,14 @@ package org.apache.datafusion.spark;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 
 import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.IntervalUnit;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -186,6 +188,83 @@ class SchemaConverterTest {
             List.of(nullable("item", new ArrowType.FloatingPoint(FloatingPointPrecision.HALF))));
     assertEquals(DataTypes.createArrayType(DataTypes.FloatType, true), spark(halfFixed));
     assertEquals("List(Float32)", SchemaConverter.castTargetString(halfFixed));
+  }
+
+  @Test
+  void largeListCastsToVariableList() {
+    // LargeList maps to ArrayType but has no ArrowColumnVector accessor -> must cast to List.
+    Field large =
+        new Field(
+            "v",
+            FieldType.nullable(new ArrowType.LargeList()),
+            List.of(nullable("item", new ArrowType.Int(32, true))));
+    assertEquals(DataTypes.createArrayType(DataTypes.IntegerType, true), spark(large));
+    assertEquals("List(Int32)", SchemaConverter.castTargetString(large));
+  }
+
+  @Test
+  void fixedSizeBinaryCastsToBinary() {
+    // FixedSizeBinary maps to BinaryType but has no accessor -> must cast to variable Binary.
+    Field fsb = nullable("c", new ArrowType.FixedSizeBinary(16));
+    assertEquals(DataTypes.BinaryType, spark(fsb));
+    assertEquals("Binary", SchemaConverter.castTargetString(fsb));
+  }
+
+  @Test
+  void date64CastsToDate32() {
+    Field d64 = nullable("c", new ArrowType.Date(DateUnit.MILLISECOND));
+    assertEquals(DataTypes.DateType, spark(d64));
+    assertEquals("Date32", SchemaConverter.castTargetString(d64));
+
+    // Date32 is consumable -> no cast.
+    assertNull(SchemaConverter.castTargetString(nullable("c", new ArrowType.Date(DateUnit.DAY))));
+  }
+
+  @Test
+  void sparkTargetIsAlwaysConsumable() {
+    // The core invariant behind the plan-time guard: every widened target is Spark-consumable.
+    List<Field> samples =
+        List.of(
+            nullable("a", new ArrowType.Int(8, false)),
+            nullable("b", new ArrowType.Int(64, false)),
+            nullable("c", new ArrowType.FloatingPoint(FloatingPointPrecision.HALF)),
+            nullable("d", new ArrowType.Timestamp(TimeUnit.NANOSECOND, "UTC")),
+            nullable("e", new ArrowType.Date(DateUnit.MILLISECOND)),
+            nullable("f", new ArrowType.Time(TimeUnit.MICROSECOND, 64)),
+            nullable("g", new ArrowType.FixedSizeBinary(4)),
+            new Field(
+                "h",
+                FieldType.nullable(new ArrowType.FixedSizeList(2)),
+                List.of(
+                    nullable("item", new ArrowType.FloatingPoint(FloatingPointPrecision.HALF)))),
+            new Field(
+                "i",
+                FieldType.nullable(new ArrowType.LargeList()),
+                List.of(nullable("item", new ArrowType.Int(16, false)))),
+            new Field(
+                "j",
+                FieldType.nullable(ArrowType.Struct.INSTANCE),
+                List.of(nullable("x", new ArrowType.Int(32, false)))));
+    for (Field f : samples) {
+      assertConsumable(SchemaConverter.sparkTarget(f));
+    }
+  }
+
+  private static void assertConsumable(Field field) {
+    assertTrue(
+        SchemaConverter.sparkConsumable(field.getType()),
+        "sparkTarget produced a non-consumable type: " + field.getType());
+    field.getChildren().forEach(SchemaConverterTest::assertConsumable);
+  }
+
+  @Test
+  void unsupportedTypeFailsAtSchemaBuild() {
+    // An Interval has no accessor and no supported cast -> fail fast at inferSchema, naming it.
+    Schema schema =
+        new Schema(List.of(Field.nullable("dur", new ArrowType.Interval(IntervalUnit.DAY_TIME))));
+    IllegalArgumentException e =
+        assertThrows(IllegalArgumentException.class, () -> SchemaConverter.toSparkSchema(schema));
+    assertTrue(e.getMessage().contains("dur"), e.getMessage());
   }
 
   // --- schema-level: metadata flag + projection planning -------------------

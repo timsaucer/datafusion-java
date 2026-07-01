@@ -22,11 +22,12 @@ package org.apache.datafusion.spark;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.arrow.vector.types.DateUnit;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
-import org.apache.arrow.vector.types.IntervalUnit;
 import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.spark.sql.types.DataType;
 import org.apache.spark.sql.types.DataTypes;
@@ -37,28 +38,38 @@ import org.apache.spark.sql.types.StructType;
 
 /**
  * Converts an Arrow schema (produced by the ADBC scan) into a Spark {@link StructType}, and plans
- * the source-side casts that make the scan emit Spark-native Arrow.
+ * the source-side casts that make the scan emit Arrow that Spark's vectorized reader can consume.
  *
- * <p>Done directly rather than through Spark's {@code ArrowUtils} so the connector depends only on
- * our Arrow version, never Spark's bundled one.
+ * <p>An Arrow column must clear two independent gates:
  *
- * <p>Spark's vectorized {@code ArrowColumnVector} reads a fixed set of Arrow layouts: signed ints,
- * 32/64-bit floats, microsecond timestamps, string/binary, decimal, date, and nested
- * list/struct/map of those. Two categories of source type need handling:
+ * <ol>
+ *   <li><b>Schema mapping</b> -- an Arrow type maps to some Spark {@code DataType} (used at {@code
+ *       inferSchema}).
+ *   <li><b>Vectorized read</b> -- Spark's {@code ArrowColumnVector} has an accessor for the vector.
+ *       This gate is <em>narrower</em> than the first and is not a public API.
+ * </ol>
+ *
+ * <p>Enumerating the two gates by hand lets them drift: a type can map to a Spark type yet have no
+ * accessor (e.g. {@code FixedSizeList}/{@code LargeList} both map to {@code ArrayType} but only a
+ * variable {@code ListVector} is readable), producing an {@code UNSUPPORTED_ARROWTYPE} at task time
+ * rather than plan time. To avoid that, everything derives from one authority:
  *
  * <ul>
- *   <li><b>Directly representable</b> -- the layout already matches; only the type mapping was
- *       missing (binary, nested list/struct/map, date, decimal, µs timestamp, null). These pass
- *       through untouched.
- *   <li><b>Cast required</b> -- the layout differs from what {@code ArrowColumnVector} expects, so
- *       the scan must cast at the source (unsigned ints, Float16, non-µs timestamps, time). We map
- *       these to the Spark type they will be cast <em>to</em>, and {@link #castTargetString} names
- *       the Arrow target so {@link SqlQuery} can wrap the column in {@code arrow_cast}.
+ *   <li>{@link #sparkConsumable} -- the read gate: {@code true} iff {@code ArrowColumnVector} has
+ *       an accessor for the type. Mirrors the accessors in Spark 4.0's {@code
+ *       ArrowColumnVector.initAccessor} (deliberately the narrower gate).
+ *   <li>{@link #sparkTarget} -- the nearest consumable Arrow type for a field (identity if already
+ *       consumable), recursing into children. Non-consumable leaves widen (unsigned -&gt; signed,
+ *       Float16 -&gt; Float32, non-µs timestamp -&gt; µs, Date64 -&gt; Date32, Time -&gt; int,
+ *       FixedSizeBinary -&gt; Binary) and non-consumable containers convert ({@code
+ *       FixedSizeList}/{@code LargeList} -&gt; {@code List}).
  * </ul>
  *
- * <p>The cast is pushed into the scan (see {@link SqlQuery}), so this converter and the reader only
- * ever agree on Spark-native types: the reported Spark type of a column always equals what {@code
- * ArrowColumnVector} produces from the (possibly cast) Arrow output.
+ * <p>Then the reported Spark type, the cast decision, and the cast target all come from {@code
+ * sparkTarget}, so the two gates cannot drift and adding a type is one case, not several. The cast
+ * is pushed into the scan (see {@link SqlQuery}); {@link #toSparkSchema} asserts at plan time that
+ * every target is consumable, so an unsupported type fails in planning with a clear message rather
+ * than as an opaque executor crash.
  */
 final class SchemaConverter {
 
@@ -77,11 +88,15 @@ final class SchemaConverter {
   static StructType toSparkSchema(Schema arrowSchema) {
     StructType struct = new StructType();
     for (Field field : arrowSchema.getFields()) {
+      Field target = sparkTarget(field);
+      // Plan-time guard: if a type cannot be normalized to something Spark can read, fail here
+      // (naming the column) instead of crashing on an executor with UNSUPPORTED_ARROWTYPE.
+      ensureConsumable(field.getName(), target);
       Metadata metadata =
-          needsCast(field)
-              ? new MetadataBuilder().putBoolean(CAST_METADATA_KEY, true).build()
-              : Metadata.empty();
-      struct = struct.add(field.getName(), toSparkType(field), field.isNullable(), metadata);
+          target == field
+              ? Metadata.empty()
+              : new MetadataBuilder().putBoolean(CAST_METADATA_KEY, true).build();
+      struct = struct.add(field.getName(), mapConsumable(target), field.isNullable(), metadata);
     }
     return struct;
   }
@@ -109,9 +124,15 @@ final class SchemaConverter {
     return columns;
   }
 
+  /** Whether the column (recursively) is not something Spark's reader can consume as-is. */
+  static boolean needsCast(Field field) {
+    return sparkTarget(field) != field;
+  }
+
   /** The Arrow type string for {@code arrow_cast}, or {@code null} if the column needs no cast. */
   static String castTargetString(Field field) {
-    return needsCast(field) ? renderArrowType(field) : null;
+    Field target = sparkTarget(field);
+    return target == field ? null : render(target);
   }
 
   /**
@@ -131,35 +152,148 @@ final class SchemaConverter {
     return new ProjectionColumn(first.getName(), castTargetString(first));
   }
 
-  // --- Arrow type -> Spark type ---------------------------------------------
+  // --- The two-gate authority -----------------------------------------------
 
+  /**
+   * Whether Spark's vectorized {@code ArrowColumnVector} has an accessor for this Arrow type.
+   * Mirrors {@code ArrowColumnVector.initAccessor} in Spark 4.0 -- deliberately the narrower gate,
+   * so a type that maps to a Spark {@code DataType} but has no accessor (unsigned, Float16, non-µs
+   * timestamp, Date64, {@code Time*}, {@code FixedSizeList}/{@code LargeList}, {@code
+   * FixedSizeBinary}, {@code Interval}, {@code Dictionary}, ...) is reported as non-consumable.
+   */
+  static boolean sparkConsumable(ArrowType type) {
+    if (type instanceof ArrowType.Bool) {
+      return true;
+    }
+    if (type instanceof ArrowType.Int i) {
+      return i.getIsSigned()
+          && (i.getBitWidth() == 8
+              || i.getBitWidth() == 16
+              || i.getBitWidth() == 32
+              || i.getBitWidth() == 64);
+    }
+    if (type instanceof ArrowType.FloatingPoint fp) {
+      return fp.getPrecision() == FloatingPointPrecision.SINGLE
+          || fp.getPrecision() == FloatingPointPrecision.DOUBLE;
+    }
+    if (type instanceof ArrowType.Utf8 || type instanceof ArrowType.LargeUtf8) {
+      return true;
+    }
+    if (type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary) {
+      return true; // FixedSizeBinary is NOT readable.
+    }
+    if (type instanceof ArrowType.Decimal d) {
+      return d.getBitWidth() == 128; // Spark's DecimalVector is 128-bit; Decimal256 is not read.
+    }
+    if (type instanceof ArrowType.Date d) {
+      return d.getUnit() == DateUnit.DAY; // Date64 (MILLISECOND) is not readable.
+    }
+    if (type instanceof ArrowType.Timestamp ts) {
+      return ts.getUnit() == TimeUnit.MICROSECOND; // only µs, any timezone.
+    }
+    if (type instanceof ArrowType.Duration) {
+      return true;
+    }
+    if (type instanceof ArrowType.Null) {
+      return true;
+    }
+    // Only the variable-offset containers are readable (not FixedSizeList / LargeList).
+    return type instanceof ArrowType.List
+        || type instanceof ArrowType.Struct
+        || type instanceof ArrowType.Map;
+  }
+
+  /**
+   * The nearest Spark-consumable field for {@code field}, recursing into children. Returns the same
+   * instance when nothing changes (so {@code sparkTarget(f) == f} means "no cast needed").
+   */
+  static Field sparkTarget(Field field) {
+    ArrowType type = field.getType();
+    ArrowType targetType = type;
+
+    if (type instanceof ArrowType.Int i && !i.getIsSigned()) {
+      targetType =
+          switch (i.getBitWidth()) {
+            case 8 -> new ArrowType.Int(16, true);
+            case 16 -> new ArrowType.Int(32, true);
+            case 32 -> new ArrowType.Int(64, true);
+            case 64 -> new ArrowType.Decimal(20, 0, 128); // no lossless signed 64-bit target
+            default -> type;
+          };
+    } else if (type instanceof ArrowType.FloatingPoint fp
+        && fp.getPrecision() == FloatingPointPrecision.HALF) {
+      targetType = new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
+    } else if (type instanceof ArrowType.Timestamp ts && ts.getUnit() != TimeUnit.MICROSECOND) {
+      targetType = new ArrowType.Timestamp(TimeUnit.MICROSECOND, ts.getTimezone());
+    } else if (type instanceof ArrowType.Date d && d.getUnit() != DateUnit.DAY) {
+      targetType = new ArrowType.Date(DateUnit.DAY);
+    } else if (type instanceof ArrowType.Time t) {
+      // Spark has no time-of-day accessor; carry the raw ticks as the matching-width signed int.
+      targetType = new ArrowType.Int(t.getBitWidth() == 32 ? 32 : 64, true);
+    } else if (type instanceof ArrowType.FixedSizeBinary) {
+      targetType = new ArrowType.Binary();
+    } else if (type instanceof ArrowType.FixedSizeList || type instanceof ArrowType.LargeList) {
+      // Spark reads ArrayType only from a variable ListVector.
+      targetType = new ArrowType.List();
+    }
+
+    // Recurse into children (list element, struct fields, map entries), widening each.
+    List<Field> children = field.getChildren();
+    List<Field> targetChildren = new ArrayList<>(children.size());
+    boolean childChanged = false;
+    for (Field child : children) {
+      Field targetChild = sparkTarget(child);
+      childChanged |= targetChild != child;
+      targetChildren.add(targetChild);
+    }
+
+    if (targetType == type && !childChanged) {
+      return field;
+    }
+    FieldType ft = new FieldType(field.isNullable(), targetType, field.getDictionary());
+    return new Field(field.getName(), ft, targetChildren);
+  }
+
+  /** Assert every node of a {@code sparkTarget} result is consumable, else fail with the column. */
+  private static void ensureConsumable(String column, Field target) {
+    if (!sparkConsumable(target.getType())) {
+      throw new IllegalArgumentException(
+          "column '"
+              + column
+              + "': Arrow type "
+              + target.getType()
+              + " has no Spark reader and "
+              + "no supported cast; the connector cannot expose it to Spark");
+    }
+    for (Field child : target.getChildren()) {
+      ensureConsumable(column, child);
+    }
+  }
+
+  // --- Arrow (consumable) type -> Spark type ---------------------------------
+
+  /** Map an already-{@link #sparkConsumable} field to its Spark {@link DataType}. */
   static DataType toSparkType(Field field) {
+    Field target = sparkTarget(field);
+    ensureConsumable(field.getName(), target);
+    return mapConsumable(target);
+  }
+
+  private static DataType mapConsumable(Field field) {
     ArrowType type = field.getType();
     if (type instanceof ArrowType.Bool) {
       return DataTypes.BooleanType;
     }
     if (type instanceof ArrowType.Int i) {
-      if (i.getIsSigned()) {
-        return switch (i.getBitWidth()) {
-          case 8 -> DataTypes.ByteType;
-          case 16 -> DataTypes.ShortType;
-          case 32 -> DataTypes.IntegerType;
-          case 64 -> DataTypes.LongType;
-          default -> throw unsupported(field);
-        };
-      }
-      // Unsigned: widened to the next signed width it will be cast to (u64 has no lossless
-      // signed 64-bit target, so it becomes Decimal(20,0)).
       return switch (i.getBitWidth()) {
-        case 8 -> DataTypes.ShortType;
-        case 16 -> DataTypes.IntegerType;
-        case 32 -> DataTypes.LongType;
-        case 64 -> DataTypes.createDecimalType(20, 0);
+        case 8 -> DataTypes.ByteType;
+        case 16 -> DataTypes.ShortType;
+        case 32 -> DataTypes.IntegerType;
+        case 64 -> DataTypes.LongType;
         default -> throw unsupported(field);
       };
     }
     if (type instanceof ArrowType.FloatingPoint fp) {
-      // Float16 has no Spark type; it is widened to Float.
       return fp.getPrecision() == FloatingPointPrecision.DOUBLE
           ? DataTypes.DoubleType
           : DataTypes.FloatType;
@@ -167,21 +301,14 @@ final class SchemaConverter {
     if (type instanceof ArrowType.Utf8 || type instanceof ArrowType.LargeUtf8) {
       return DataTypes.StringType;
     }
-    if (type instanceof ArrowType.Binary
-        || type instanceof ArrowType.LargeBinary
-        || type instanceof ArrowType.FixedSizeBinary) {
+    if (type instanceof ArrowType.Binary || type instanceof ArrowType.LargeBinary) {
       return DataTypes.BinaryType;
     }
     if (type instanceof ArrowType.Date) {
       return DataTypes.DateType;
     }
     if (type instanceof ArrowType.Timestamp ts) {
-      // Unit is normalized to microseconds by the cast; the timezone decides NTZ vs zoned.
       return ts.getTimezone() == null ? DataTypes.TimestampNTZType : DataTypes.TimestampType;
-    }
-    if (type instanceof ArrowType.Time t) {
-      // Spark has no time-of-day accessor; the value is cast to its raw integer of ticks.
-      return t.getBitWidth() == 32 ? DataTypes.IntegerType : DataTypes.LongType;
     }
     if (type instanceof ArrowType.Decimal d) {
       return DataTypes.createDecimalType(d.getPrecision(), d.getScale());
@@ -192,24 +319,15 @@ final class SchemaConverter {
     if (type instanceof ArrowType.Duration) {
       return DataTypes.createDayTimeIntervalType();
     }
-    if (type instanceof ArrowType.Interval iv) {
-      return switch (iv.getUnit()) {
-        case YEAR_MONTH -> DataTypes.createYearMonthIntervalType();
-        case DAY_TIME -> DataTypes.createDayTimeIntervalType();
-        default -> throw unsupported(field);
-      };
-    }
-    if (type instanceof ArrowType.List
-        || type instanceof ArrowType.LargeList
-        || type instanceof ArrowType.FixedSizeList) {
+    if (type instanceof ArrowType.List) {
       Field element = field.getChildren().get(0);
-      return DataTypes.createArrayType(toSparkType(element), element.isNullable());
+      return DataTypes.createArrayType(mapConsumable(element), element.isNullable());
     }
     if (type instanceof ArrowType.Struct) {
       List<StructField> children = new ArrayList<>();
       for (Field child : field.getChildren()) {
         children.add(
-            DataTypes.createStructField(child.getName(), toSparkType(child), child.isNullable()));
+            DataTypes.createStructField(child.getName(), mapConsumable(child), child.isNullable()));
       }
       return DataTypes.createStructType(children);
     }
@@ -217,66 +335,25 @@ final class SchemaConverter {
       Field entries = field.getChildren().get(0);
       Field key = entries.getChildren().get(0);
       Field value = entries.getChildren().get(1);
-      return DataTypes.createMapType(toSparkType(key), toSparkType(value), value.isNullable());
+      return DataTypes.createMapType(mapConsumable(key), mapConsumable(value), value.isNullable());
     }
     throw unsupported(field);
   }
 
-  // --- Cast planning --------------------------------------------------------
+  // --- Arrow (consumable) type -> arrow_cast type string ---------------------
 
   /**
-   * Whether the column (recursively) has any layout that Spark's reader cannot consume directly.
+   * Render an already-{@link #sparkConsumable} field as an {@code arrow_cast} type string (the
+   * reversible {@code arrow::datatypes::DataType} display form DataFusion's {@code arrow_cast}
+   * parses). Called only on {@link #sparkTarget} output, which is consumable by construction.
    */
-  static boolean needsCast(Field field) {
-    ArrowType type = field.getType();
-    if (type instanceof ArrowType.Int i && !i.getIsSigned()) {
-      return true;
-    }
-    if (type instanceof ArrowType.FloatingPoint fp
-        && fp.getPrecision() == FloatingPointPrecision.HALF) {
-      return true;
-    }
-    if (type instanceof ArrowType.Timestamp ts && ts.getUnit() != TimeUnit.MICROSECOND) {
-      return true;
-    }
-    if (type instanceof ArrowType.Time) {
-      return true;
-    }
-    // Spark's ArrowColumnVector backs ArrayType only from a variable ListVector, never a
-    // FixedSizeListVector, so a fixed-size list must always be cast to a variable list.
-    if (type instanceof ArrowType.FixedSizeList) {
-      return true;
-    }
-    for (Field child : field.getChildren()) {
-      if (needsCast(child)) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  /**
-   * Render the widened Arrow type as an {@code arrow_cast} type string (the reversible {@code
-   * arrow::datatypes::DataType} display form that DataFusion's {@code arrow_cast} parses). Cast
-   * leaves become their widened target; everything else is rendered as-is so a nested cast carries
-   * its unchanged siblings along.
-   */
-  private static String renderArrowType(Field field) {
+  private static String render(Field field) {
     ArrowType type = field.getType();
     if (type instanceof ArrowType.Bool) {
       return "Boolean";
     }
     if (type instanceof ArrowType.Int i) {
-      if (i.getIsSigned()) {
-        return "Int" + i.getBitWidth();
-      }
-      return switch (i.getBitWidth()) {
-        case 8 -> "Int16";
-        case 16 -> "Int32";
-        case 32 -> "Int64";
-        case 64 -> "Decimal128(20, 0)";
-        default -> throw unsupported(field);
-      };
+      return "Int" + i.getBitWidth();
     }
     if (type instanceof ArrowType.FloatingPoint fp) {
       return fp.getPrecision() == FloatingPointPrecision.DOUBLE ? "Float64" : "Float32";
@@ -293,46 +370,24 @@ final class SchemaConverter {
     if (type instanceof ArrowType.LargeBinary) {
       return "LargeBinary";
     }
-    if (type instanceof ArrowType.FixedSizeBinary fb) {
-      return "FixedSizeBinary(" + fb.getByteWidth() + ")";
-    }
-    if (type instanceof ArrowType.Date d) {
-      return switch (d.getUnit()) {
-        case DAY -> "Date32";
-        case MILLISECOND -> "Date64";
-      };
+    if (type instanceof ArrowType.Date) {
+      return "Date32";
     }
     if (type instanceof ArrowType.Timestamp ts) {
-      // Normalize to microseconds, preserving the timezone.
       return ts.getTimezone() == null
           ? "Timestamp(Microsecond)"
           : "Timestamp(Microsecond, \"" + ts.getTimezone() + "\")";
     }
-    if (type instanceof ArrowType.Time t) {
-      return t.getBitWidth() == 32 ? "Int32" : "Int64";
-    }
     if (type instanceof ArrowType.Decimal d) {
-      String kind = d.getBitWidth() == 256 ? "Decimal256" : "Decimal128";
-      return kind + "(" + d.getPrecision() + ", " + d.getScale() + ")";
+      return "Decimal128(" + d.getPrecision() + ", " + d.getScale() + ")";
     }
     if (type instanceof ArrowType.Duration dur) {
       return "Duration(" + timeUnitName(dur.getUnit()) + ")";
-    }
-    if (type instanceof ArrowType.Interval iv) {
-      return "Interval(" + intervalUnitName(iv.getUnit()) + ")";
     }
     if (type instanceof ArrowType.Null) {
       return "Null";
     }
     if (type instanceof ArrowType.List) {
-      return "List(" + listChild(field.getChildren().get(0)) + ")";
-    }
-    if (type instanceof ArrowType.LargeList) {
-      return "LargeList(" + listChild(field.getChildren().get(0)) + ")";
-    }
-    if (type instanceof ArrowType.FixedSizeList) {
-      // Cast to a variable list: Spark can only read ArrayType from a ListVector. The element is
-      // rendered cast-aware, so e.g. FixedSizeList<Float16> becomes List(Float32).
       return "List(" + listChild(field.getChildren().get(0)) + ")";
     }
     if (type instanceof ArrowType.Struct) {
@@ -357,10 +412,9 @@ final class SchemaConverter {
     throw unsupported(field);
   }
 
-  /** {@code <nullability><type>[, field: 'name']} -- the list/fixed-size-list child form. */
+  /** {@code <nullability><type>[, field: 'name']} -- the list child form. */
   private static String listChild(Field field) {
-    String rendered = nullability(field) + renderArrowType(field);
-    // The default list-field name ("item") is elided by the display form.
+    String rendered = nullability(field) + render(field);
     return "item".equals(field.getName())
         ? rendered
         : rendered + ", field: '" + field.getName() + "'";
@@ -368,7 +422,7 @@ final class SchemaConverter {
 
   /** {@code "name": <nullability><type>} -- the struct/map field form. */
   private static String structField(Field field) {
-    return debugQuote(field.getName()) + ": " + nullability(field) + renderArrowType(field);
+    return debugQuote(field.getName()) + ": " + nullability(field) + render(field);
   }
 
   private static String nullability(Field field) {
@@ -381,14 +435,6 @@ final class SchemaConverter {
       case MILLISECOND -> "Millisecond";
       case MICROSECOND -> "Microsecond";
       case NANOSECOND -> "Nanosecond";
-    };
-  }
-
-  private static String intervalUnitName(IntervalUnit unit) {
-    return switch (unit) {
-      case YEAR_MONTH -> "YearMonth";
-      case DAY_TIME -> "DayTime";
-      case MONTH_DAY_NANO -> "MonthDayNano";
     };
   }
 

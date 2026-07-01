@@ -48,9 +48,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    ArrayRef, BinaryArray, FixedSizeListBuilder, Float16Array, Int64Array, ListBuilder,
-    StringArray, StringBuilder, StructBuilder, TimestampNanosecondArray, UInt16Array,
-    UInt16Builder, UInt64Array,
+    ArrayRef, BinaryArray, Date64Array, FixedSizeBinaryBuilder, FixedSizeListBuilder, Float16Array,
+    Int64Array, LargeListBuilder, ListBuilder, StringArray, StringBuilder, StructBuilder,
+    TimestampNanosecondArray, UInt16Array, UInt16Builder, UInt64Array,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -149,6 +149,12 @@ struct Row {
     /// A fixed-size list of two unsigned ints -- Spark cannot read FixedSizeList and must have it
     /// cast to a variable List (with the element widened). Always length 2.
     vec: [u16; 2],
+    /// A LargeList of strings -- maps to ArrayType but has no accessor, so it casts to List.
+    labels: &'static [&'static str],
+    /// FixedSizeBinary(4) -- maps to BinaryType but has no accessor, so it casts to Binary.
+    digest: [u8; 4],
+    /// Date64 (ms since epoch, day-aligned) -- no accessor, casts to Date32.
+    day_ms: i64,
 }
 
 // Values are chosen to exercise the widening edges: channel spans past i16::MAX, big includes
@@ -166,6 +172,9 @@ const TYPE_ROWS: [Row; 3] = [
         score: 1.5,
         tags: &[1, 2],
         vec: [10, 20],
+        labels: &["a", "b"],
+        digest: [0x01, 0x02, 0x03, 0x04],
+        day_ms: 1_599_955_200_000, // 2020-09-13 (18518 days)
     },
     Row {
         id: 2,
@@ -178,6 +187,9 @@ const TYPE_ROWS: [Row; 3] = [
         score: 2.5,
         tags: &[],
         vec: [30, 40],
+        labels: &[],
+        digest: [0x00, 0x00, 0x00, 0x00],
+        day_ms: 1_609_977_600_000, // 2021-01-07 (18634 days)
     },
     Row {
         id: 3,
@@ -190,6 +202,9 @@ const TYPE_ROWS: [Row; 3] = [
         score: 3.5,
         tags: &[3],
         vec: [50, 60],
+        labels: &["c"],
+        digest: [0xff, 0xfe, 0xfd, 0xfc],
+        day_ms: 1_620_000_000_000, // 2021-05-03 (18750 days)
     },
 ];
 
@@ -217,6 +232,9 @@ impl TypesTableProvider {
             Field::new("score", proto[7].data_type().clone(), true),
             Field::new("tags", proto[8].data_type().clone(), true),
             Field::new("vec", proto[9].data_type().clone(), true),
+            Field::new("labels", proto[10].data_type().clone(), true),
+            Field::new("digest", proto[11].data_type().clone(), true),
+            Field::new("day", proto[12].data_type().clone(), true),
         ]));
 
         // One self-contained single-row batch per partition (see the module docs on why we do
@@ -265,7 +283,7 @@ impl TableProvider for TypesTableProvider {
     }
 }
 
-/// Build the ten single-row column arrays for one [`Row`], in schema order.
+/// Build the single-row column arrays for one [`Row`], in schema order.
 fn row_columns(row: &Row) -> Vec<ArrayRef> {
     let mut tags = ListBuilder::new(UInt16Builder::new());
     for t in row.tags {
@@ -278,6 +296,15 @@ fn row_columns(row: &Row) -> Vec<ArrayRef> {
         vec.values().append_value(v);
     }
     vec.append(true);
+
+    let mut labels = LargeListBuilder::new(StringBuilder::new());
+    for l in row.labels {
+        labels.values().append_value(l);
+    }
+    labels.append(true);
+
+    let mut digest = FixedSizeBinaryBuilder::new(row.digest.len() as i32);
+    digest.append_value(row.digest).expect("digest bytes");
 
     let attr_fields = vec![
         Field::new("key", DataType::Utf8, true),
@@ -307,5 +334,8 @@ fn row_columns(row: &Row) -> Vec<ArrayRef> {
         Arc::new(Float16Array::from(vec![f16::from_f32(row.score)])),
         Arc::new(tags.finish()) as ArrayRef,
         Arc::new(vec.finish()) as ArrayRef,
+        Arc::new(labels.finish()) as ArrayRef,
+        Arc::new(digest.finish()) as ArrayRef,
+        Arc::new(Date64Array::from(vec![row.day_ms])),
     ]
 }

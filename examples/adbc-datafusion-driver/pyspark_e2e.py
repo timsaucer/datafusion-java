@@ -118,7 +118,17 @@ try:
     # cast columns are flagged (so filter pushdown stays off them); pass-through ones are not.
     cast_cols = {f.name for f in dft.schema.fields if f.metadata.get(CAST_META_KEY)}
     print("cast columns:", sorted(cast_cols))
-    assert cast_cols == {"channel", "big", "event_time", "score", "tags", "vec"}, cast_cols
+    assert cast_cols == {
+        "channel",
+        "big",
+        "event_time",
+        "score",
+        "tags",
+        "vec",
+        "labels",
+        "digest",
+        "day",
+    }, cast_cols
 
     # count() prunes the projection to empty; the connector must not emit a bare SELECT * (which
     # would return the raw, uncast schema and fail the reader on the ns timestamp / unsigned ids).
@@ -162,6 +172,20 @@ try:
     assert r1["vec"] == [10, 20]
     assert r2["vec"] == [30, 40]
     assert r3["vec"] == [50, 60]
+
+    # LargeList<Utf8> -> Array<String>
+    assert r1["labels"] == ["a", "b"]
+    assert r2["labels"] == []
+    assert r3["labels"] == ["c"]
+
+    # FixedSizeBinary -> Binary
+    assert bytes(r1["digest"]) == b"\x01\x02\x03\x04"
+    assert bytes(r3["digest"]) == b"\xff\xfe\xfd\xfc"
+
+    # Date64 -> Date32 (day-aligned)
+    assert r1["day"] == datetime.date(2020, 9, 13)
+    assert r2["day"] == datetime.date(2021, 1, 7)
+    assert r3["day"] == datetime.date(2021, 5, 3)
 
     # nested List<Struct<key,val>> passes through
     assert [(x["key"], x["val"]) for x in r1["attrs"]] == [("a", "1")]
